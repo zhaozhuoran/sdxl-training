@@ -34,6 +34,9 @@ def main():
         # Execute the main custom training loop
         trainer.run()
         logger.info("Training completed successfully! Exiting.")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user. Exiting immediately.")
+        sys.exit(130)
     except Exception as e:
         logger.exception(f"Training run failed with a critical error: {e}")
         sys.exit(1)

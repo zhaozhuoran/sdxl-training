@@ -416,71 +416,83 @@ class SDXLTrainer:
         if hasattr(self.vae, "eval"):
             self.vae.eval()
 
-        with torch.no_grad():
-            for idx in range(len(dataset)):
-                img_path, caption, path_hash = dataset.samples_with_hashes[idx]
+        from tqdm import tqdm
+        progress_bar = tqdm(
+            total=len(dataset),
+            desc="Caching dataset",
+            dynamic_ncols=True
+        )
 
-                latents = None
-                prompt_embeds = None
-                pooled_prompt_embeds = None
+        try:
+            with torch.no_grad():
+                for idx in range(len(dataset)):
+                    img_path, caption, path_hash = dataset.samples_with_hashes[idx]
 
-                disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
-                disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
+                    latents = None
+                    prompt_embeds = None
+                    pooled_prompt_embeds = None
 
-                # 1. Latent calculation
-                if cache_latents:
-                    if disk_latent_path and disk_latent_path.exists():
-                        latents = torch.load(disk_latent_path, map_location="cpu")
-                    else:
-                        if self.is_test_mode:
-                            latents = torch.randn(1, 3, self.config.dataset.resolution, self.config.dataset.resolution, dtype=self.weight_dtype)
+                    disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
+                    disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
+
+                    # 1. Latent calculation
+                    if cache_latents:
+                        if disk_latent_path and disk_latent_path.exists():
+                            latents = torch.load(disk_latent_path, map_location="cpu")
                         else:
-                            from PIL import Image
-                            try:
-                                with Image.open(img_path) as img:
-                                    image = img.convert("RGB")
-                            except Exception as e:
-                                raise IOError(f"Error loading image {img_path}: {e}")
+                            if self.is_test_mode:
+                                latents = torch.randn(1, 3, self.config.dataset.resolution, self.config.dataset.resolution, dtype=self.weight_dtype)
+                            else:
+                                from PIL import Image
+                                try:
+                                    with Image.open(img_path) as img:
+                                        image = img.convert("RGB")
+                                except Exception as e:
+                                    raise IOError(f"Error loading image {img_path}: {e}")
 
-                            pixel_values = dataset.transform(image).unsqueeze(0).to(self.device, dtype=torch.float32)
-                            latents_dist = self.vae.encode(pixel_values).latent_dist
-                            latents = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
-                            latents = latents * self.vae.config.scaling_factor
-                            latents = latents.to(self.weight_dtype).cpu()
+                                pixel_values = dataset.transform(image).unsqueeze(0).to(self.device, dtype=torch.float32)
+                                latents_dist = self.vae.encode(pixel_values).latent_dist
+                                latents = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
+                                latents = latents * self.vae.config.scaling_factor
+                                latents = latents.to(self.weight_dtype).cpu()
 
-                        if disk_latent_path and self.config.dataset.cache_destination == "disk":
-                            torch.save(latents, disk_latent_path)
+                            if disk_latent_path and self.config.dataset.cache_destination == "disk":
+                                torch.save(latents, disk_latent_path)
 
-                # 2. Text Encoder outputs calculation
-                if cache_te:
-                    if disk_te_path and disk_te_path.exists():
-                        te_data = torch.load(disk_te_path, map_location="cpu")
-                        prompt_embeds = te_data["prompt_embeds"]
-                        pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
-                    else:
-                        if self.is_test_mode:
-                            prompt_embeds = torch.randn(1, 77, 2048, dtype=self.weight_dtype)
-                            pooled_prompt_embeds = torch.randn(1, 1280, dtype=self.weight_dtype)
+                    # 2. Text Encoder outputs calculation
+                    if cache_te:
+                        if disk_te_path and disk_te_path.exists():
+                            te_data = torch.load(disk_te_path, map_location="cpu")
+                            prompt_embeds = te_data["prompt_embeds"]
+                            pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
                         else:
-                            pe, ppe = self._encode_prompt([caption])
-                            prompt_embeds = pe.cpu()
-                            pooled_prompt_embeds = ppe.cpu()
+                            if self.is_test_mode:
+                                prompt_embeds = torch.randn(1, 77, 2048, dtype=self.weight_dtype)
+                                pooled_prompt_embeds = torch.randn(1, 1280, dtype=self.weight_dtype)
+                            else:
+                                pe, ppe = self._encode_prompt([caption])
+                                prompt_embeds = pe.cpu()
+                                pooled_prompt_embeds = ppe.cpu()
 
-                        if disk_te_path and self.config.dataset.cache_destination == "disk":
-                            torch.save({
-                                "prompt_embeds": prompt_embeds,
-                                "pooled_prompt_embeds": pooled_prompt_embeds
-                            }, disk_te_path)
+                            if disk_te_path and self.config.dataset.cache_destination == "disk":
+                                torch.save({
+                                    "prompt_embeds": prompt_embeds,
+                                    "pooled_prompt_embeds": pooled_prompt_embeds
+                                }, disk_te_path)
 
-                # Store in RAM cache if destination is ram
-                if self.config.dataset.cache_destination == "ram":
-                    cache_item = {}
-                    if latents is not None:
-                        cache_item["latents"] = latents
-                    if prompt_embeds is not None:
-                        cache_item["prompt_embeds"] = prompt_embeds
-                        cache_item["pooled_prompt_embeds"] = pooled_prompt_embeds
-                    dataset.ram_cache[path_hash] = cache_item
+                    # Store in RAM cache if destination is ram
+                    if self.config.dataset.cache_destination == "ram":
+                        cache_item = {}
+                        if latents is not None:
+                            cache_item["latents"] = latents
+                        if prompt_embeds is not None:
+                            cache_item["prompt_embeds"] = prompt_embeds
+                            cache_item["pooled_prompt_embeds"] = pooled_prompt_embeds
+                        dataset.ram_cache[path_hash] = cache_item
+
+                    progress_bar.update(1)
+        finally:
+            progress_bar.close()
 
         logger.info("Dataset caching completed successfully.")
 
@@ -657,89 +669,110 @@ class SDXLTrainer:
 
         logger.info(f"Starting training loop from step {start_step} to {self.config.training.steps}")
 
-        while self.global_step < self.config.training.steps:
-            # UNet is set to training mode
-            self.unet.train()
-            # Keep frozen model parts in eval mode
-            self.text_encoder_1.eval()
-            self.text_encoder_2.eval()
-            if hasattr(self.vae, "eval"):
-                self.vae.eval()
+        from tqdm import tqdm
+        from tqdm.contrib.logging import logging_redirect_tqdm
 
-            epoch_loss = 0.0
-            step_count = 0
+        progress_bar = tqdm(
+            total=self.config.training.steps,
+            initial=start_step,
+            desc="Training steps",
+            dynamic_ncols=True
+        )
 
-            for batch in self.dataloader:
-                if self.global_step >= self.config.training.steps:
-                    break
+        try:
+            with logging_redirect_tqdm(loggers=[logger]):
+                while self.global_step < self.config.training.steps:
+                    # UNet is set to training mode
+                    self.unet.train()
+                    # Keep frozen model parts in eval mode
+                    self.text_encoder_1.eval()
+                    self.text_encoder_2.eval()
+                    if hasattr(self.vae, "eval"):
+                        self.vae.eval()
 
-                step_start_time = time.time()
-                loss_val = self.train_step(batch)
+                    epoch_loss = 0.0
+                    step_count = 0
 
-                self.global_step += 1
-                step_count += 1
-                epoch_loss += loss_val
+                    for batch in self.dataloader:
+                        if self.global_step >= self.config.training.steps:
+                            break
 
-                # Calculate step time
-                step_duration = time.time() - step_start_time
+                        step_start_time = time.time()
+                        loss_val = self.train_step(batch)
 
-                # Structured step logging
-                logger.info(
-                    f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
-                    f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s"
-                )
+                        self.global_step += 1
+                        step_count += 1
+                        epoch_loss += loss_val
 
-                # Recovery Checkpoint Policy by Steps or Time
-                time_since_recovery = time.time() - last_recovery_time
-                trigger_step = (
-                    self.config.checkpoint.save_every_steps
-                    and self.global_step % self.config.checkpoint.save_every_steps == 0
-                )
-                trigger_time = (
-                    self.config.checkpoint.save_every_seconds
-                    and time_since_recovery >= self.config.checkpoint.save_every_seconds
-                )
+                        # Calculate step time
+                        step_duration = time.time() - step_start_time
 
-                if trigger_step or trigger_time:
-                    logger.info(f"Triggering rolling recovery checkpoint at step={self.global_step}...")
-                    self.checkpoint_manager.save_checkpoint(
-                        self.global_step,
-                        self.current_epoch,
-                        self.lora_manager,
-                        self.optimizer,
-                        self.scheduler,
-                        self.grad_scaler
+                        # Structured step logging
+                        logger.info(
+                            f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
+                            f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s"
+                        )
+
+                        # Update tqdm progress bar with postfix metadata
+                        progress_bar.set_postfix({
+                            "loss": f"{loss_val:.4f}",
+                            "epoch": self.current_epoch
+                        })
+                        progress_bar.update(1)
+
+                    # Recovery Checkpoint Policy by Steps or Time
+                    time_since_recovery = time.time() - last_recovery_time
+                    trigger_step = (
+                        self.config.checkpoint.save_every_steps
+                        and self.global_step % self.config.checkpoint.save_every_steps == 0
                     )
-                    last_recovery_time = time.time()
-
-                # Snapshot Checkpoint Policy by Steps or Time (measured completely independently of recovery triggers)
-                time_since_snapshot = time.time() - last_snapshot_time
-                trigger_snap_step = (
-                    self.config.checkpoint.snapshot_every_steps
-                    and self.global_step % self.config.checkpoint.snapshot_every_steps == 0
-                )
-                trigger_snap_time = (
-                    self.config.checkpoint.snapshot_every_seconds
-                    and time_since_snapshot >= self.config.checkpoint.snapshot_every_seconds
-                )
-
-                if trigger_snap_step or trigger_snap_time:
-                    logger.info(f"Triggering long-term snapshot checkpoint at step={self.global_step}...")
-                    self.checkpoint_manager.save_checkpoint(
-                        self.global_step,
-                        self.current_epoch,
-                        self.lora_manager,
-                        self.optimizer,
-                        self.scheduler,
-                        self.grad_scaler,
-                        is_snapshot=True
+                    trigger_time = (
+                        self.config.checkpoint.save_every_seconds
+                        and time_since_recovery >= self.config.checkpoint.save_every_seconds
                     )
-                    last_snapshot_time = time.time()
 
-            # End of epoch telemetry
-            avg_loss = epoch_loss / max(1, step_count)
-            logger.info(f"--- Completed Epoch {self.current_epoch} | Average Loss: {avg_loss:.4f} ---")
-            self.current_epoch += 1
+                    if trigger_step or trigger_time:
+                        logger.info(f"Triggering rolling recovery checkpoint at step={self.global_step}...")
+                        self.checkpoint_manager.save_checkpoint(
+                            self.global_step,
+                            self.current_epoch,
+                            self.lora_manager,
+                            self.optimizer,
+                            self.scheduler,
+                            self.grad_scaler
+                        )
+                        last_recovery_time = time.time()
+
+                    # Snapshot Checkpoint Policy by Steps or Time (measured completely independently of recovery triggers)
+                    time_since_snapshot = time.time() - last_snapshot_time
+                    trigger_snap_step = (
+                        self.config.checkpoint.snapshot_every_steps
+                        and self.global_step % self.config.checkpoint.snapshot_every_steps == 0
+                    )
+                    trigger_snap_time = (
+                        self.config.checkpoint.snapshot_every_seconds
+                        and time_since_snapshot >= self.config.checkpoint.snapshot_every_seconds
+                    )
+
+                    if trigger_snap_step or trigger_snap_time:
+                        logger.info(f"Triggering long-term snapshot checkpoint at step={self.global_step}...")
+                        self.checkpoint_manager.save_checkpoint(
+                            self.global_step,
+                            self.current_epoch,
+                            self.lora_manager,
+                            self.optimizer,
+                            self.scheduler,
+                            self.grad_scaler,
+                            is_snapshot=True
+                        )
+                        last_snapshot_time = time.time()
+
+                # End of epoch telemetry
+                avg_loss = epoch_loss / max(1, step_count)
+                logger.info(f"--- Completed Epoch {self.current_epoch} | Average Loss: {avg_loss:.4f} ---")
+                self.current_epoch += 1
+        finally:
+            progress_bar.close()
 
         # Post training: Export final LoRA safetensors to lora directory
         logger.info("Training completed successfully. Exporting final compatible LoRA safetensors...")

@@ -1,0 +1,174 @@
+# ==============================================================================
+# SDXL LoRA Training - Example YAML Configuration
+# ==============================================================================
+# This configuration file is used to control all aspects of the SDXL training pipeline.
+# It is designed to be highly readable, modular, strongly validated, and extensible.
+# All parameters can be customized for your dataset and hardware configurations.
+
+# ------------------------------------------------------------------------------
+# 1. Model Configuration
+# ------------------------------------------------------------------------------
+model:
+  # Path to pretrained SDXL base model (can be a local directory or HF model hub ID)
+  # Examples: "stabilityai/stable-diffusion-xl-base-1.0", "path/to/local/sdxl_base"
+  pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
+
+  # Optional path to a custom VAE model. If null, the VAE from the base model is used.
+  # Value: string (e.g., "madebyollin/sdxl-vae-fp16-fix") or null
+  vae_path: null
+
+# ------------------------------------------------------------------------------
+# 2. Dataset Configuration
+# ------------------------------------------------------------------------------
+dataset:
+  # Path to the dataset directory containing image-caption pairs (e.g. 001.png, 001.txt)
+  path: "tests/fixtures/dataset"
+
+  # Batch size per GPU step. Higher values speed up training but require more VRAM.
+  # Options/Optional values: 1, 2, 4, 8
+  batch_size: 1
+
+  # Training resolution. Images will be automatically resized and center-cropped.
+  # Options/Optional values: 1024, 768, 512 (1024 is recommended for standard SDXL)
+  resolution: 1024
+
+  # Shuffle the training samples every epoch to improve model generalization.
+  # Options/Optional values: true, false
+  shuffle: true
+
+  # Number of worker threads for background data preprocessing.
+  # Options/Optional values: 0, 2, 4, 8 (use 0 for single-thread/debug on Windows)
+  num_workers: 4
+
+# ------------------------------------------------------------------------------
+# 3. Training Loop & Precision Configuration
+# ------------------------------------------------------------------------------
+training:
+  # Total number of global training steps.
+  # Options/Optional values: Any positive integer (e.g., 1000, 2000, 5000)
+  steps: 1000
+
+  # Random seed for training determinism and reproducibility.
+  # Options/Optional values: null or any integer (e.g., 42)
+  seed: 42
+
+  # Number of steps to accumulate gradients before performing optimizer update.
+  # Options/Optional values: 1, 2, 4, 8
+  gradient_accumulation_steps: 1
+
+  # Enable gradient checkpointing to dramatically save VRAM at a slight speed cost.
+  # Options/Optional values: true, false
+  gradient_checkpointing: true
+
+  # Mixed precision mode. Highly recommended to use "bf16" (bfloat16) or "fp16" (float16).
+  # Options/Optional values: "bf16" (strongly recommended for modern GPUs), "fp16", "no"
+  mixed_precision: "bf16"
+
+# ------------------------------------------------------------------------------
+# 4. Network Parameter Configuration (LoRA)
+# ------------------------------------------------------------------------------
+network:
+  # The method name. Currently supports "lora".
+  type: "lora"
+
+  # Network dimension (rank) of the low-rank adapters. Higher dimensions can capture
+  # finer details but require more parameters and memory.
+  # Options/Optional values: 16, 32, 64, 128
+  rank: 64
+
+  # Network Alpha scaling parameter. Controls the weight/intensity of the LoRA model.
+  # Options/Optional values: 16, 32, 64, 128 (Typically set to rank/2 or equal to rank)
+  alpha: 32.0
+
+  # Optional lists of target modules for injection (supports custom substrings/regex).
+  # If set to null, the framework defaults to standard SDXL attention layers.
+  unet_targets: null
+  text_encoder_1_targets: null
+  text_encoder_2_targets: null
+
+# ------------------------------------------------------------------------------
+# 5. Optimizer Configuration
+# ------------------------------------------------------------------------------
+optimizer:
+  # Optimizer algorithm. Use "adamw8bit" to significantly reduce VRAM footprint.
+  # Options/Optional values: "adamw8bit" (recommended), "adamw"
+  type: "adamw8bit"
+
+  # Learning rate for training.
+  # Options/Optional values: 1e-5, 5e-5, 1e-4 (recommended default is 1e-4)
+  learning_rate: 1e-4
+
+  # L2 penalty weight decay.
+  # Options/Optional values: 1e-2, 1e-3, 1e-4
+  weight_decay: 1e-2
+
+  # Coefficients used for computing running averages of gradient and its square.
+  beta1: 0.9
+  beta2: 0.999
+
+  # Term added to denominator to improve numerical stability.
+  epsilon: 1e-8
+
+# ------------------------------------------------------------------------------
+# 6. Learning Rate Scheduler Configuration
+# ------------------------------------------------------------------------------
+scheduler:
+  # Learning rate scheduler type.
+  # Options/Optional values: "constant", "cosine" (decaying learning rate)
+  type: "cosine"
+
+  # Number of steps to linearly warmup the learning rate from 0 to target value.
+  # Options/Optional values: Any positive integer (e.g., 0, 100, 500)
+  warmup_steps: 100
+
+# ------------------------------------------------------------------------------
+# 7. Checkpointing, Retention & Validation Configuration
+# ------------------------------------------------------------------------------
+checkpoint:
+  # Save rolling recovery checkpoints (used for crash recovery) every N steps.
+  # Options/Optional values: null (disable step-based), or any integer (e.g., 100, 250)
+  save_every_steps: 100
+
+  # Optional save interval by seconds (e.g., save every 300 seconds).
+  # Options/Optional values: null (disable time-based), or any integer (e.g., 300)
+  save_every_seconds: null
+
+  # Number of latest recovery checkpoints to keep in rolling history.
+  # Options/Optional values: Any positive integer (e.g., 3, 5, 120)
+  keep_last_recovery: 5
+
+  # Save long-term snapshot checkpoints (preserved indefinitely) every N steps.
+  # Options/Optional values: null (disable step-based), or any integer (e.g., 500, 1000)
+  snapshot_every_steps: 500
+
+  # Optional save interval by seconds for snapshots (e.g., save every 1800 seconds).
+  # Options/Optional values: null, or any integer (e.g., 1800)
+  snapshot_every_seconds: null
+
+# ------------------------------------------------------------------------------
+# 8. Resume & Disaster Recovery Configuration
+# ------------------------------------------------------------------------------
+resume:
+  # Recovery mode.
+  # - "none": Start training from scratch.
+  # - "auto": Scan, validate state correctness, and load the newest valid checkpoint
+  #           (recovering from corrupted checkpoints by falling back to snapshots).
+  # - "manual": Specify a direct path in manual_path.
+  # Options/Optional values: "none", "auto", "manual"
+  mode: "auto"
+
+  # Direct path to a recovery or snapshot .pt file. Only required when mode is "manual".
+  # Options/Optional values: null or path string (e.g., "outputs/test_run/checkpoints/recovery/recovery-000200.pt")
+  manual_path: null
+
+# ------------------------------------------------------------------------------
+# 9. Output Directory Management Configuration
+# ------------------------------------------------------------------------------
+output:
+  # Base outputs directory.
+  # Options/Optional values: "outputs/", "runs/" or any other directory name
+  directory: "outputs/"
+
+  # Name of current training experiment. Outputs are structured under directory/experiment_name/.
+  # Options/Optional values: Any valid directory name string
+  experiment_name: "test_lora_run"

@@ -40,6 +40,22 @@ dataset:
   # Options/Optional values: 0, 2, 4, 8 (use 0 for single-thread/debug on Windows)
   num_workers: 4
 
+  # Pre-computes and caches VAE latents once to save VRAM and training time.
+  # Default: true
+  cache_latents: true
+
+  # Pre-computes and caches Text Encoder outputs once, only if train_text_encoder is false.
+  # Default: true
+  cache_text_encoder_outputs: true
+
+  # Destination for pre-computed caches: "ram" (stores in memory) or "disk" (saves to cache files).
+  # Default: "ram"
+  cache_destination: "ram"
+
+  # Custom directory path for disk caching. If null, defaults to a hidden ".cache_latents" folder in the dataset path.
+  # Default: null
+  cache_dir: null
+
 # ------------------------------------------------------------------------------
 # 3. Training Loop & Precision Configuration
 # ------------------------------------------------------------------------------
@@ -63,6 +79,10 @@ training:
   # Mixed precision mode. Highly recommended to use "bf16" (bfloat16) or "fp16" (float16).
   # Options/Optional values: "bf16" (strongly recommended for modern GPUs), "fp16", "no"
   mixed_precision: "bf16"
+
+  # Whether to train the Text Encoders. If false, we disable Text Encoder LoRA injection and only train UNet.
+  # Default: false (UNet only)
+  train_text_encoder: false
 
 # ------------------------------------------------------------------------------
 # 4. Network Parameter Configuration (LoRA)

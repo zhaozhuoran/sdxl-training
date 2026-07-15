@@ -17,6 +17,17 @@ class DatasetConfig(BaseModel):
     resolution: int = Field(1024, description="Image resolution for training.")
     shuffle: bool = Field(True, description="Shuffle dataset.")
     num_workers: int = Field(4, description="Number of subprocesses for data loading.")
+    cache_latents: bool = Field(True, description="Pre-computes and caches VAE latents.")
+    cache_text_encoder_outputs: bool = Field(True, description="Pre-computes and caches Text Encoder outputs (only when Text Encoder is not trained).")
+    cache_destination: str = Field("ram", description="Destination for caching: 'ram' or 'disk'.")
+    cache_dir: Optional[str] = Field(None, description="Custom directory for disk caching. Defaults to .cache_latents inside the dataset directory if null.")
+
+    @field_validator("cache_destination")
+    @classmethod
+    def validate_cache_destination(cls, v: str) -> str:
+        if v not in {"ram", "disk"}:
+            raise ValueError("cache_destination must be either 'ram' or 'disk'")
+        return v
 
 
 class TrainingConfig(BaseModel):
@@ -25,6 +36,7 @@ class TrainingConfig(BaseModel):
     gradient_accumulation_steps: int = Field(1, description="Number of updates steps to accumulate before performing a backward/update pass.")
     gradient_checkpointing: bool = Field(True, description="Enable gradient checkpointing.")
     mixed_precision: str = Field("bf16", description="Mixed precision compute type. Must be 'fp16', 'bf16', or 'no'.")
+    train_text_encoder: bool = Field(False, description="Whether to train the Text Encoders. If False, only train UNet.")
 
     @field_validator("mixed_precision")
     @classmethod

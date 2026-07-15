@@ -81,3 +81,62 @@ output:
     lora_files = list((chk_dir / "lora").glob("*.safetensors"))
     assert len(lora_files) == 1
     assert "step-000005.safetensors" in lora_files[0].name
+
+
+def test_trainer_unet_only_and_caching(tmp_path):
+    # Setup dataset
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+
+    # Generate image and caption
+    img = Image.new("RGB", (128, 128), color="blue")
+    img.save(dataset_dir / "00001.png")
+    (dataset_dir / "00001.txt").write_text("a blue placeholder image", encoding="utf-8")
+
+    config_yaml = f"""
+model:
+  pretrained_model_name_or_path: "mock-model"
+dataset:
+  path: "{dataset_dir}"
+  batch_size: 1
+  resolution: 64
+  cache_latents: true
+  cache_text_encoder_outputs: true
+  cache_destination: "ram"
+training:
+  steps: 3
+  mixed_precision: "no"
+  train_text_encoder: false
+network:
+  type: "lora"
+  rank: 8
+  alpha: 4.0
+optimizer:
+  type: "adamw"
+  learning_rate: 1e-4
+scheduler:
+  type: "constant"
+output:
+  directory: "{tmp_path}/outputs"
+  experiment_name: "unet_only_cache_run"
+"""
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(config_yaml)
+
+    # Initialize trainer
+    trainer = SDXLTrainer(str(config_file), is_test_mode=True)
+    trainer.run()
+
+    # Verify that only unet has LoRA injected (no te1 or te2 keys)
+    injected_keys = list(trainer.lora_manager.injected_modules.keys())
+    assert any(k.startswith("unet.") for k in injected_keys)
+    assert not any(k.startswith("te1.") for k in injected_keys)
+    assert not any(k.startswith("te2.") for k in injected_keys)
+
+    # Verify that caching populated the dataset ram_cache
+    dataset = trainer.dataloader.dataset
+    assert len(dataset.ram_cache) == 1
+    for k, v in dataset.ram_cache.items():
+        assert "latents" in v
+        assert "prompt_embeds" in v
+        assert "pooled_prompt_embeds" in v

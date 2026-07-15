@@ -223,8 +223,13 @@ class SDXLTrainer:
         )
 
         self.lora_manager.inject_lora(self.unet, prefix="unet", targets=self.lora_manager.unet_targets)
-        self.lora_manager.inject_lora(self.text_encoder_1, prefix="te1", targets=self.lora_manager.te1_targets)
-        self.lora_manager.inject_lora(self.text_encoder_2, prefix="te2", targets=self.lora_manager.te2_targets)
+
+        if self.config.training.train_text_encoder:
+            logger.info("Training of Text Encoders is enabled. Injecting LoRA layers into Text Encoders.")
+            self.lora_manager.inject_lora(self.text_encoder_1, prefix="te1", targets=self.lora_manager.te1_targets)
+            self.lora_manager.inject_lora(self.text_encoder_2, prefix="te2", targets=self.lora_manager.te2_targets)
+        else:
+            logger.info("Training of Text Encoders is disabled. UNet-only LoRA training will be performed.")
 
         # Shift injected parameters to target device with the appropriate dtype
         for wrapper in self.lora_manager.injected_modules.values():
@@ -372,6 +377,113 @@ class SDXLTrainer:
 
             logger.info(f"Successfully recovered training progress at global_step={self.global_step}, epoch={self.current_epoch}.")
 
+    def cache_dataset(self) -> None:
+        """
+        Pre-computes and caches VAE latents and Text Encoder outputs.
+        Saves them to RAM (in-memory) or Disk (cache files).
+        """
+        cache_latents = self.config.dataset.cache_latents
+        cache_te = self.config.dataset.cache_text_encoder_outputs and not self.config.training.train_text_encoder
+
+        if not cache_latents and not cache_te:
+            return
+
+        logger.info("Pre-computing and caching dataset outputs...")
+        dataset = self.dataloader.dataset
+
+        # Determine disk cache directory
+        cache_dir = self.config.dataset.cache_dir
+        if not cache_dir:
+            cache_dir = os.path.join(self.config.dataset.path, ".cache_latents")
+        self.cache_dir_path = Path(cache_dir)
+
+        if self.config.dataset.cache_destination == "disk":
+            self.cache_dir_path.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Caching to disk at: {self.cache_dir_path}")
+        else:
+            logger.info(f"Caching to RAM. Will look up pre-existing disk cache at: {self.cache_dir_path}")
+
+        # Initialize RAM cache dictionaries on the dataset
+        dataset.ram_cache = {}
+        dataset.cache_destination = self.config.dataset.cache_destination
+        dataset.cache_dir_path = self.cache_dir_path
+        dataset.cache_latents_enabled = cache_latents
+        dataset.cache_te_enabled = cache_te
+
+        self.unet.eval()
+        self.text_encoder_1.eval()
+        self.text_encoder_2.eval()
+        if hasattr(self.vae, "eval"):
+            self.vae.eval()
+
+        with torch.no_grad():
+            for idx in range(len(dataset)):
+                img_path, caption, path_hash = dataset.samples_with_hashes[idx]
+
+                latents = None
+                prompt_embeds = None
+                pooled_prompt_embeds = None
+
+                disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
+                disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
+
+                # 1. Latent calculation
+                if cache_latents:
+                    if disk_latent_path and disk_latent_path.exists():
+                        latents = torch.load(disk_latent_path, map_location="cpu")
+                    else:
+                        if self.is_test_mode:
+                            latents = torch.randn(1, 3, self.config.dataset.resolution, self.config.dataset.resolution, dtype=self.weight_dtype)
+                        else:
+                            from PIL import Image
+                            try:
+                                with Image.open(img_path) as img:
+                                    image = img.convert("RGB")
+                            except Exception as e:
+                                raise IOError(f"Error loading image {img_path}: {e}")
+
+                            pixel_values = dataset.transform(image).unsqueeze(0).to(self.device, dtype=torch.float32)
+                            latents_dist = self.vae.encode(pixel_values).latent_dist
+                            latents = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
+                            latents = latents * self.vae.config.scaling_factor
+                            latents = latents.to(self.weight_dtype).cpu()
+
+                        if disk_latent_path and self.config.dataset.cache_destination == "disk":
+                            torch.save(latents, disk_latent_path)
+
+                # 2. Text Encoder outputs calculation
+                if cache_te:
+                    if disk_te_path and disk_te_path.exists():
+                        te_data = torch.load(disk_te_path, map_location="cpu")
+                        prompt_embeds = te_data["prompt_embeds"]
+                        pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
+                    else:
+                        if self.is_test_mode:
+                            prompt_embeds = torch.randn(1, 77, 2048, dtype=self.weight_dtype)
+                            pooled_prompt_embeds = torch.randn(1, 1280, dtype=self.weight_dtype)
+                        else:
+                            pe, ppe = self._encode_prompt([caption])
+                            prompt_embeds = pe.cpu()
+                            pooled_prompt_embeds = ppe.cpu()
+
+                        if disk_te_path and self.config.dataset.cache_destination == "disk":
+                            torch.save({
+                                "prompt_embeds": prompt_embeds,
+                                "pooled_prompt_embeds": pooled_prompt_embeds
+                            }, disk_te_path)
+
+                # Store in RAM cache if destination is ram
+                if self.config.dataset.cache_destination == "ram":
+                    cache_item = {}
+                    if latents is not None:
+                        cache_item["latents"] = latents
+                    if prompt_embeds is not None:
+                        cache_item["prompt_embeds"] = prompt_embeds
+                        cache_item["pooled_prompt_embeds"] = pooled_prompt_embeds
+                    dataset.ram_cache[path_hash] = cache_item
+
+        logger.info("Dataset caching completed successfully.")
+
     def _encode_prompt(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encodes prompts using text encoders 1 & 2 for SDXL conditioning.
@@ -441,18 +553,26 @@ class SDXLTrainer:
 
         with torch.amp.autocast(device_type=device_type, dtype=dtype):
             if self.is_test_mode:
-                # Mock loss forward pass for verification
-                pixel_values = batch["pixel_values"].to(self.device, dtype=dtype)
-                output = self.unet(pixel_values)
+                if "latents" in batch:
+                    # In test mode with caching
+                    latents = batch["latents"].to(self.device, dtype=dtype)
+                    # For mock UNet in test mode, UNet forward expects [b, c, h, w] matching latents
+                    output = self.unet(latents)
+                else:
+                    pixel_values = batch["pixel_values"].to(self.device, dtype=dtype)
+                    output = self.unet(pixel_values)
                 loss = torch.mean((output - 0.0) ** 2)
             else:
                 # Real SDXL forward pass
-                # 1. Encode images to latents
-                pixel_values = batch["pixel_values"].to(self.device, dtype=torch.float32)
-                # Pass through standard VAE to extract latents
-                latents = self.vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-                latents = latents.to(dtype)
+                # 1. Get or encode images to latents
+                if "latents" in batch:
+                    latents = batch["latents"].to(self.device, dtype=dtype)
+                else:
+                    pixel_values = batch["pixel_values"].to(self.device, dtype=torch.float32)
+                    # Pass through standard VAE to extract latents
+                    latents = self.vae.encode(pixel_values).latent_dist.sample()
+                    latents = latents * self.vae.config.scaling_factor
+                    latents = latents.to(dtype)
 
                 # 2. Add noise mathematically correctly using DDPMScheduler
                 noise = torch.randn_like(latents)
@@ -466,10 +586,14 @@ class SDXLTrainer:
                 # Use standard noise scheduler API
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # 3. Encode prompt captions
-                prompt_embeds, pooled_prompt_embeds = self._encode_prompt(batch["captions"])
-                prompt_embeds = prompt_embeds.to(dtype)
-                pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
+                # 3. Get or encode prompt captions
+                if "prompt_embeds" in batch:
+                    prompt_embeds = batch["prompt_embeds"].to(self.device, dtype=dtype)
+                    pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, dtype=dtype)
+                else:
+                    prompt_embeds, pooled_prompt_embeds = self._encode_prompt(batch["captions"])
+                    prompt_embeds = prompt_embeds.to(dtype)
+                    pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
 
                 # 4. Set up standard SDXL micro-conditioning added_cond_kwargs
                 # Default SDXL coordinates (e.g. 1024x1024 original, no crop)
@@ -519,6 +643,9 @@ class SDXLTrainer:
         self.setup_scheduler()
         self.setup_dataloader()
         self.setup_precision()
+
+        # Cache dataset (latents & text encoder outputs) if enabled
+        self.cache_dataset()
 
         # Resume state if required
         self.handle_resume()

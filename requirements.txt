@@ -1,0 +1,15 @@
+# Pinned dependency set for sdxl-training (Python 3.11.x)
+# All versions are locked to exact releases to guarantee a reproducible,
+# stable environment. Do not use >= constraints here.
+torch==2.5.1
+torchvision==0.20.1
+diffusers==0.32.2
+transformers==4.46.3
+accelerate==1.1.1
+safetensors==0.4.5
+pyyaml==6.0.2
+pydantic==2.10.4
+pillow==11.0.0
+tqdm==4.67.1
+numpy==1.26.4
+bitsandbytes==0.45.2

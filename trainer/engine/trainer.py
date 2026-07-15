@@ -159,28 +159,51 @@ class SDXLTrainer:
         model_path = self.config.model.pretrained_model_name_or_path
         logger.info(f"Loading pretrained models from: {model_path}")
 
-        # Load models
-        self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=self.weight_dtype)
-        self.text_encoder_1 = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=self.weight_dtype)
-        self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=self.weight_dtype)
+        is_single_file = os.path.isfile(model_path) and model_path.lower().endswith((".safetensors", ".ckpt"))
 
-        vae_path = self.config.model.vae_path or model_path
-        subfolder_vae = "vae" if not self.config.model.vae_path else None
-        # VAE is typically kept in float32 during training to avoid NaN values
-        self.vae = AutoencoderKL.from_pretrained(vae_path, subfolder=subfolder_vae, torch_dtype=torch.float32)
+        if is_single_file:
+            # Single-file checkpoint (e.g. a standalone SDXL .safetensors / .ckpt)
+            # Load the full pipeline once, then extract individual components.
+            from diffusers import StableDiffusionXLPipeline
 
-        # Load noise scheduler
-        self.noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
+            logger.info("Detected single-file checkpoint. Loading via StableDiffusionXLPipeline.from_single_file(...)")
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                model_path, torch_dtype=self.weight_dtype, local_files_only=True
+            )
+
+            self.unet = pipe.unet
+            self.text_encoder_1 = pipe.text_encoder
+            self.text_encoder_2 = pipe.text_encoder_2
+            # VAE is typically kept in float32 during training to avoid NaN values
+            self.vae = pipe.vae.to(dtype=torch.float32)
+            self.tokenizer_1 = pipe.tokenizer
+            self.tokenizer_2 = pipe.tokenizer_2
+            # Reuse the pipeline scheduler (defaults to a compatible DDPM-like scheduler)
+            self.noise_scheduler = pipe.scheduler
+        else:
+            # Standard diffusers directory layout
+            # Load models
+            self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=self.weight_dtype)
+            self.text_encoder_1 = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=self.weight_dtype)
+            self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=self.weight_dtype)
+
+            vae_path = self.config.model.vae_path or model_path
+            subfolder_vae = "vae" if not self.config.model.vae_path else None
+            # VAE is typically kept in float32 during training to avoid NaN values
+            self.vae = AutoencoderKL.from_pretrained(vae_path, subfolder=subfolder_vae, torch_dtype=torch.float32)
+
+            # Load noise scheduler
+            self.noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
+
+            # Tokenizers
+            self.tokenizer_1 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", use_fast=False)
+            self.tokenizer_2 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", use_fast=False)
 
         # Place models on active device
         self.unet.to(self.device)
         self.text_encoder_1.to(self.device)
         self.text_encoder_2.to(self.device)
         self.vae.to(self.device)
-
-        # Tokenizers
-        self.tokenizer_1 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", use_fast=False)
-        self.tokenizer_2 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", use_fast=False)
 
         # Freeze original models
         self.unet.requires_grad_(False)

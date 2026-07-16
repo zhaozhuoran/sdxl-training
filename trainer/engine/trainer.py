@@ -116,22 +116,8 @@ class SDXLTrainer:
             self.weight_dtype = torch.bfloat16
 
         if self.is_test_mode:
-            logger.info("Test mode active: setting up tiny mock models.")
-            # Build tiny mock models so integration tests can execute on CPU
-            class MockUNet(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    # Match a target layer name so injection catches it.
-                    # Input pixel_values have 3 channels.
-                    self.to_q = nn.Linear(3, 3)
-                    self.to_out = nn.Linear(3, 3)
-                def forward(self, x, timesteps=None, encoder_hidden_states=None, added_cond_kwargs=None):
-                    b, c, h, w = x.shape
-                    x_flat = x.permute(0, 2, 3, 1).reshape(-1, c)
-                    out_flat = self.to_q(x_flat)
-                    out = out_flat.reshape(b, h, w, c).permute(0, 3, 1, 2)
-                    return out
-
+            logger.info("Test mode active: setting up tiny mock models (VAE + Text Encoders only; UNet loaded later).")
+            # Text Encoder mocks so integration tests can execute on CPU
             class MockEncoder(nn.Module):
                 def __init__(self):
                     super().__init__()
@@ -139,7 +125,6 @@ class SDXLTrainer:
                 def forward(self, x):
                     return x
 
-            self.unet = MockUNet().to(self.device, dtype=self.weight_dtype)
             self.text_encoder_1 = MockEncoder().to(self.device, dtype=self.weight_dtype)
             self.text_encoder_2 = MockEncoder().to(self.device, dtype=self.weight_dtype)
             self.vae = nn.Identity().to(self.device)
@@ -153,37 +138,32 @@ class SDXLTrainer:
         # Real model loading
         # In actual execution, we load the standard diffusers components
         # (this requires diffusers and transformers packages)
-        from diffusers import UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+        from diffusers import AutoencoderKL, DDPMScheduler
         from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
 
         model_path = self.config.model.pretrained_model_name_or_path
-        logger.info(f"Loading pretrained models from: {model_path}")
+        logger.info(f"Loading VAE + Text Encoders from: {model_path}")
 
+        # NOTE: The UNet is intentionally NOT loaded here. It is only required for
+        # the training loop, not for caching latents/text-encoder outputs. Deferring
+        # it (see setup_unet) keeps VRAM free during the precache phase and avoids OOM.
         is_single_file = os.path.isfile(model_path) and model_path.lower().endswith((".safetensors", ".ckpt"))
 
         if is_single_file:
-            # Single-file checkpoint (e.g. a standalone SDXL .safetensors / .ckpt)
-            # Load the full pipeline once, then extract individual components.
             from diffusers import StableDiffusionXLPipeline
 
             logger.info("Detected single-file checkpoint. Loading via StableDiffusionXLPipeline.from_single_file(...)")
             pipe = StableDiffusionXLPipeline.from_single_file(
                 model_path, torch_dtype=self.weight_dtype, local_files_only=True
             )
-
-            self.unet = pipe.unet
             self.text_encoder_1 = pipe.text_encoder
             self.text_encoder_2 = pipe.text_encoder_2
             # VAE is typically kept in float32 during training to avoid NaN values
             self.vae = pipe.vae.to(dtype=torch.float32)
             self.tokenizer_1 = pipe.tokenizer
             self.tokenizer_2 = pipe.tokenizer_2
-            # Reuse the pipeline scheduler (defaults to a compatible DDPM-like scheduler)
             self.noise_scheduler = pipe.scheduler
         else:
-            # Standard diffusers directory layout
-            # Load models
-            self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=self.weight_dtype)
             self.text_encoder_1 = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=self.weight_dtype)
             self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=self.weight_dtype)
 
@@ -192,24 +172,56 @@ class SDXLTrainer:
             # VAE is typically kept in float32 during training to avoid NaN values
             self.vae = AutoencoderKL.from_pretrained(vae_path, subfolder=subfolder_vae, torch_dtype=torch.float32)
 
-            # Load noise scheduler
             self.noise_scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")
-
-            # Tokenizers
             self.tokenizer_1 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", use_fast=False)
             self.tokenizer_2 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", use_fast=False)
 
-        # Place models on active device
-        self.unet.to(self.device)
+        # Place VAE + Text Encoders on active device
         self.text_encoder_1.to(self.device)
         self.text_encoder_2.to(self.device)
         self.vae.to(self.device)
 
         # Freeze original models
-        self.unet.requires_grad_(False)
         self.text_encoder_1.requires_grad_(False)
         self.text_encoder_2.requires_grad_(False)
         self.vae.requires_grad_(False)
+
+    def setup_unet(self) -> None:
+        """Loads the UNet (only needed for the training loop, not for caching)."""
+        if self.unet is not None:
+            return
+        if self.is_test_mode:
+            logger.info("Test mode: building tiny mock UNet.")
+
+            class MockUNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.to_q = nn.Linear(3, 3)
+                    self.to_out = nn.Linear(3, 3)
+                def forward(self, x, timesteps=None, encoder_hidden_states=None, added_cond_kwargs=None):
+                    b, c, h, w = x.shape
+                    x_flat = x.permute(0, 2, 3, 1).reshape(-1, c)
+                    out_flat = self.to_q(x_flat)
+                    out = out_flat.reshape(b, h, w, c).permute(0, 3, 1, 2)
+                    return out
+
+            self.unet = MockUNet().to(self.device, dtype=self.weight_dtype)
+            return
+
+        from diffusers import UNet2DConditionModel
+        model_path = self.config.model.pretrained_model_name_or_path
+        logger.info(f"Loading UNet from: {model_path}")
+        is_single_file = os.path.isfile(model_path) and model_path.lower().endswith((".safetensors", ".ckpt"))
+        if is_single_file:
+            from diffusers import StableDiffusionXLPipeline
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                model_path, torch_dtype=self.weight_dtype, local_files_only=True
+            )
+            self.unet = pipe.unet
+        else:
+            self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=self.weight_dtype)
+        self.unet.to(self.device)
+        self.unet.requires_grad_(False)
 
     def setup_lora(self) -> None:
         """Injects generic parameter-efficient LoRA wrapper modules into model components."""
@@ -308,13 +320,27 @@ class SDXLTrainer:
 
     def setup_dataloader(self) -> None:
         """Creates dataset loader pipeline from image-caption folder."""
+        from trainer.caption import CaptionProcessor
+
+        ds = self.config.dataset
+        self.caption_processor = CaptionProcessor(
+            shuffle_caption=ds.shuffle_caption,
+            keep_tokens=ds.keep_tokens,
+            tag_dropout_rate=ds.tag_dropout_rate,
+            caption_dropout_rate=ds.caption_dropout_rate,
+        )
+
         logger.info(f"Setting up dataset Loader from path: {self.config.dataset.path}")
         self.dataloader = create_dataloader(
             directory_path=self.config.dataset.path,
             batch_size=self.config.dataset.batch_size,
             resolution=self.config.dataset.resolution,
             shuffle=self.config.dataset.shuffle,
-            num_workers=self.config.dataset.num_workers if not self.is_test_mode else 0
+            num_workers=self.config.dataset.num_workers if not self.is_test_mode else 0,
+            bucket_step=self.config.dataset.bucket_step,
+            bucket_min_size=self.config.dataset.bucket_min_size,
+            bucket_max_size=self.config.dataset.bucket_max_size,
+            caption_processor=self.caption_processor,
         )
 
     def setup_precision(self) -> None:
@@ -429,23 +455,44 @@ class SDXLTrainer:
         cache_latents = self.config.dataset.cache_latents
         cache_te = self.config.dataset.cache_text_encoder_outputs and not self.config.training.train_text_encoder
 
+        # Whole-caption dropout cannot be applied to cached Text Encoder outputs
+        # (the embeddings would be fixed). Disable TE caching in that case so the
+        # dropout is applied fresh per training step instead.
+        if cache_te and self.config.dataset.caption_dropout_rate > 0:
+            logger.warning(
+                "caption_dropout_rate > 0 but cache_text_encoder_outputs is enabled. "
+                "Disabling Text Encoder output caching so caption dropout applies per step."
+            )
+            cache_te = False
+
         if not cache_latents and not cache_te:
             return
 
         logger.info("Pre-computing and caching dataset outputs...")
         dataset = self.dataloader.dataset
 
-        # Determine disk cache directory
+        # Map each sample's path hash to its bucket / original_size / crop_ltrb so the
+        # cache loader can validate latent shapes and store SDXL conditioning metadata.
+        meta_by_hash = {}
+        for (_, _c, h), m in zip(dataset.samples_with_hashes, dataset.sample_meta):
+            meta_by_hash[h] = m
+
+        # Determine disk cache directory.
+        # By default the cache lives in a sibling directory named "<dataset>.cache_latents"
+        # (e.g. "/path/dataset" -> "/path/dataset.cache_latents") so it never pollutes the
+        # dataset folder. The cache is ALWAYS written to disk (kohya-style) regardless of
+        # cache_destination, so subsequent runs load instantly instead of re-encoding.
         cache_dir = self.config.dataset.cache_dir
         if not cache_dir:
-            cache_dir = os.path.join(self.config.dataset.path, ".cache_latents")
+            ds_path = Path(self.config.dataset.path)
+            cache_dir = str(ds_path.parent / (ds_path.name + ".cache_latents"))
         self.cache_dir_path = Path(cache_dir)
+        self.cache_dir_path.mkdir(parents=True, exist_ok=True)
 
-        if self.config.dataset.cache_destination == "disk":
-            self.cache_dir_path.mkdir(parents=True, exist_ok=True)
-            logger.info(f"Caching to disk at: {self.cache_dir_path}")
-        else:
-            logger.info(f"Caching to RAM. Will look up pre-existing disk cache at: {self.cache_dir_path}")
+        logger.info(
+            f"Latent/TextEncoder cache is always persisted to disk at: {self.cache_dir_path} "
+            f"(cache_destination='{self.config.dataset.cache_destination}')"
+        )
 
         # Initialize RAM cache dictionaries on the dataset
         dataset.ram_cache = {}
@@ -454,7 +501,8 @@ class SDXLTrainer:
         dataset.cache_latents_enabled = cache_latents
         dataset.cache_te_enabled = cache_te
 
-        self.unet.eval()
+        # The UNet is loaded after caching (to save VRAM during the precache phase),
+        # so only put the VAE + Text Encoders into eval mode here.
         self.text_encoder_1.eval()
         self.text_encoder_2.eval()
         if hasattr(self.vae, "eval"):
@@ -471,35 +519,48 @@ class SDXLTrainer:
 
         def load_item(item):
             img_path, caption, path_hash = item
-            disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
-            disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
+            meta = meta_by_hash[path_hash]
+            bucket = meta["bucket"]
+            original_size = meta["original_size"]
+            crop_ltrb = meta["crop_ltrb"]
+            disk_path = self.cache_dir_path / f"cache_{path_hash}.pt"
 
             latents = None
             prompt_embeds = None
             pooled_prompt_embeds = None
             pixel_values = None
 
-            from PIL import Image
-            if cache_latents and disk_latent_path is not None and disk_latent_path.exists():
-                latents = torch.load(disk_latent_path, map_location="cpu")
-            if cache_te and disk_te_path is not None and disk_te_path.exists():
-                te_data = torch.load(disk_te_path, map_location="cpu")
-                prompt_embeds = te_data["prompt_embeds"]
-                pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
+            expected_latent = (4, bucket[1] // 8, bucket[0] // 8)
+
+            if disk_path.exists():
+                try:
+                    cached = torch.load(disk_path, map_location="cpu")
+                except Exception:
+                    cached = {}
+                if cache_latents and cached.get("latents") is not None:
+                    lt = cached["latents"]
+                    # Validate latent spatial size matches the current bucket; otherwise
+                    # the config (resolution/bucket range) changed and we must recompute.
+                    if tuple(lt.shape)[1:] == expected_latent[1:]:
+                        latents = lt
+                if cache_te and cached.get("prompt_embeds") is not None:
+                    prompt_embeds = cached["prompt_embeds"]
+                    pooled_prompt_embeds = cached.get("pooled_prompt_embeds")
 
             if is_test_mode:
                 if cache_latents and latents is None:
-                    latents = torch.randn(1, 3, resolution, resolution, dtype=weight_dtype)
+                    latents = torch.randn(1, 3, bucket[1], bucket[0], dtype=weight_dtype)
                 if cache_te and prompt_embeds is None:
                     prompt_embeds = torch.randn(1, 77, 2048, dtype=weight_dtype)
                     pooled_prompt_embeds = torch.randn(1, 1280, dtype=weight_dtype)
             elif cache_latents and latents is None:
+                from PIL import Image
                 try:
                     with Image.open(img_path) as img:
                         image = img.convert("RGB")
                 except Exception as e:
                     raise IOError(f"Error loading image {img_path}: {e}")
-                pixel_values = dataset.transform(image)
+                pixel_values = dataset._transform(image, meta)
 
             return {
                 "path_hash": path_hash,
@@ -508,8 +569,10 @@ class SDXLTrainer:
                 "latents": latents,
                 "prompt_embeds": prompt_embeds,
                 "pooled_prompt_embeds": pooled_prompt_embeds,
-                "disk_latent_path": disk_latent_path,
-                "disk_te_path": disk_te_path,
+                "bucket": bucket,
+                "original_size": original_size,
+                "crop_ltrb": crop_ltrb,
+                "disk_path": disk_path,
             }
 
         def prefetch_samples():
@@ -556,18 +619,25 @@ class SDXLTrainer:
             if not buffer:
                 return
 
+            # Latents must be encoded per-bucket (each bucket has its own spatial size),
+            # so group the GPU encode by bucket before stacking.
+            from collections import defaultdict
             to_encode = [b for b in buffer if cache_latents and b["latents"] is None]
-            if to_encode:
-                pv = torch.stack([b["pixel_values"] for b in to_encode]).to(device, dtype=torch.float32)
+            groups = defaultdict(list)
+            for b in to_encode:
+                groups[b["bucket"]].append(b)
+            for _bucket, grp in groups.items():
+                pv = torch.stack([x["pixel_values"] for x in grp]).to(device, dtype=self.vae.dtype)
                 latents_dist = self.vae.encode(pv).latent_dist
                 out = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
                 out = (out * self.vae.config.scaling_factor).to(weight_dtype).cpu()
-                for b, lat in zip(to_encode, out):
-                    b["latents"] = lat
+                for x, lat in zip(grp, out):
+                    x["latents"] = lat
 
             to_te = [b for b in buffer if cache_te and b["prompt_embeds"] is None]
             if to_te:
-                captions = [b["caption"] for b in to_te]
+                # Apply caption augmentation (tag shuffle / dropout) when encoding.
+                captions = [self.caption_processor.process(b["caption"]) for b in to_te]
                 pe, ppe = self._encode_prompt(captions)
                 pe = pe.cpu()
                 ppe = ppe.cpu()
@@ -576,14 +646,23 @@ class SDXLTrainer:
                     b["pooled_prompt_embeds"] = e[1]
 
             for b in buffer:
-                if cache_destination == "disk":
-                    if cache_latents and b["latents"] is not None and b["disk_latent_path"] is not None and not b["disk_latent_path"].exists():
-                        torch.save(b["latents"], b["disk_latent_path"])
-                    if cache_te and b["prompt_embeds"] is not None and b["disk_te_path"] is not None and not b["disk_te_path"].exists():
-                        torch.save({
-                            "prompt_embeds": b["prompt_embeds"],
-                            "pooled_prompt_embeds": b["pooled_prompt_embeds"]
-                        }, b["disk_te_path"])
+                # Always persist to disk cache (kohya-style) so reruns are instant.
+                # Our own cache schema stores latents + text-encoder outputs together
+                # with the SDXL conditioning metadata (original_size, crop, bucket).
+                if (cache_latents and b["latents"] is not None) or (cache_te and b["prompt_embeds"] is not None):
+                    payload = {
+                        "format": "sdxl-trainer-cache",
+                        "version": 1,
+                        "latents": b["latents"] if cache_latents else None,
+                        "prompt_embeds": b["prompt_embeds"] if cache_te else None,
+                        "pooled_prompt_embeds": b["pooled_prompt_embeds"] if cache_te else None,
+                        "original_size": b["original_size"],
+                        "crop_ltrb": b["crop_ltrb"],
+                        "bucket_size": b["bucket"],
+                    }
+                    torch.save(payload, b["disk_path"])
+
+                # Additionally keep an in-RAM copy when destination is ram.
                 if cache_destination == "ram":
                     item = {}
                     if cache_latents and b["latents"] is not None:
@@ -661,12 +740,20 @@ class SDXLTrainer:
         return prompt_embeds, pooled_prompt_embeds
 
     def _get_add_time_ids(
-        self, original_size: Tuple[int, int], crops_coords_top_left: Tuple[int, int], target_size: Tuple[int, int]
+        self,
+        original_sizes: List[Tuple[int, int]],
+        crop_ltrbs: List[Tuple[int, int, int, int]],
+        target_sizes: List[Tuple[int, int]],
     ) -> torch.Tensor:
-        """Constructs SDXL standard micro-conditioning sizes and coordinates IDs."""
-        add_time_ids = list(original_size + crops_coords_top_left + target_size)
-        add_time_ids = torch.tensor([add_time_ids], device=self.device, dtype=self.weight_dtype)
-        return add_time_ids
+        """Builds SDXL micro-conditioning IDs for a batch from real per-image metadata.
+
+        Each row is ``[orig_w, orig_h, crop_top, crop_left, target_w, target_h]`` to match
+        the SDXL/diffusers convention (crops_coords_top_left = (top, left)).
+        """
+        rows = []
+        for (ow, oh), (l, t, r, b), (tw, th) in zip(original_sizes, crop_ltrbs, target_sizes):
+            rows.append([ow, oh, t, l, tw, th])
+        return torch.tensor(rows, device=self.device, dtype=self.weight_dtype)
 
     def train_step(self, batch: Dict[str, Any]) -> float:
         """
@@ -702,7 +789,7 @@ class SDXLTrainer:
                 if "latents" in batch:
                     latents = batch["latents"].to(self.device, dtype=dtype)
                 else:
-                    pixel_values = batch["pixel_values"].to(self.device, dtype=torch.float32)
+                    pixel_values = batch["pixel_values"].to(self.device, dtype=self.vae.dtype)
                     # Pass through standard VAE to extract latents
                     latents = self.vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
@@ -725,16 +812,17 @@ class SDXLTrainer:
                     prompt_embeds = batch["prompt_embeds"].to(self.device, dtype=dtype)
                     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, dtype=dtype)
                 else:
-                    prompt_embeds, pooled_prompt_embeds = self._encode_prompt(batch["captions"])
+                    # Text Encoder outputs are not cached (e.g. caption dropout enabled):
+                    # process captions fresh, applying whole-caption dropout per step.
+                    captions = [self.caption_processor.maybe_drop_caption(c) for c in batch["captions"]]
+                    prompt_embeds, pooled_prompt_embeds = self._encode_prompt(captions)
                     prompt_embeds = prompt_embeds.to(dtype)
                     pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
 
-                # 4. Set up standard SDXL micro-conditioning added_cond_kwargs
-                # Default SDXL coordinates (e.g. 1024x1024 original, no crop)
-                res = self.config.dataset.resolution
-                add_time_ids = self._get_add_time_ids((res, res), (0, 0), (res, res))
-                # Repeat for batch size
-                add_time_ids = add_time_ids.repeat(latents.shape[0], 1)
+                # 4. SDXL micro-conditioning from the REAL per-image original size / crop.
+                add_time_ids = self._get_add_time_ids(
+                    batch["original_sizes"], batch["crop_ltrbs"], batch["bucket_sizes"]
+                )
 
                 added_cond_kwargs = {
                     "text_embeds": pooled_prompt_embeds,
@@ -770,16 +858,21 @@ class SDXLTrainer:
         """Main training cycle coordinating epochs, checkpoints, and telemetry logging."""
         logger.info("Initializing SDXL LoRA training pipeline...")
 
-        # Setup all dependencies
+        # Setup all dependencies.
+        # Models needed for caching (VAE + Text Encoders) are loaded first; the UNet
+        # is deferred until after caching to keep VRAM free during the precache phase.
         self.setup_models()
-        self.setup_lora()
-        self.setup_optimizer()
-        self.setup_scheduler()
         self.setup_dataloader()
-        self.setup_precision()
 
         # Cache dataset (latents & text encoder outputs) if enabled
         self.cache_dataset()
+
+        # Load the UNet only now, after caching is done.
+        self.setup_unet()
+        self.setup_lora()
+        self.setup_optimizer()
+        self.setup_scheduler()
+        self.setup_precision()
 
         # Resume state if required
         self.handle_resume()

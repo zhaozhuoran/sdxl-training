@@ -52,7 +52,10 @@ dataset:
   # Default: "ram"
   cache_destination: "ram"
 
-  # Custom directory path for disk caching. If null, defaults to a hidden ".cache_latents" folder in the dataset path.
+  # Custom directory path for disk caching. If null, defaults to a sibling "<dataset>.cache_latents"
+  # directory next to the dataset folder (e.g. "/path/dataset" -> "/path/dataset.cache_latents").
+  # The latent/TextEncoder cache is ALWAYS written to disk (kohya-style) regardless of cache_destination,
+  # so reruns load instantly instead of re-encoding. Set this to override the default location.
   # Default: null
   cache_dir: null
 
@@ -65,6 +68,38 @@ dataset:
   # Higher is faster but uses more VRAM. Keep modest unless you have spare VRAM during precaching.
   # Options/Optional values: 1 (serial), 4 (recommended), 8, 16
   cache_batch_size: 4
+
+  # --- Aspect-ratio bucketing ---
+  # Images are assigned to the bucket whose aspect ratio is closest to their own,
+  # resized (preserving aspect ratio, scaling to cover) and center-cropped. This
+  # avoids the distortion of forcing every image to a single square resolution.
+  # Both bucket dimensions are multiples of bucket_step (must be 8-safe for the VAE).
+  # Options/Optional values: 32, 64 (recommended), 128
+  bucket_step: 64
+
+  # Minimum / maximum bucket dimension in pixels. null = sensible defaults
+  # (min = bucket_step, max = 1.5x resolution). Raise max_size for very wide/tall images.
+  # Options/Optional values: null, or any multiple of bucket_step (e.g. 512, 1536)
+  bucket_min_size: null
+  bucket_max_size: null
+
+  # --- Caption augmentations (Kohya-style) ---
+  # Shuffle comma-separated tags (keeping the first keep_tokens fixed in place).
+  # Options/Optional values: true, false
+  shuffle_caption: false
+
+  # Number of leading comma-separated tags to keep in place when shuffle_caption is enabled.
+  # Options/Optional values: 0, 1, 2
+  keep_tokens: 0
+
+  # Probability of dropping the WHOLE caption (empty) at training time.
+  # Requires cache_text_encoder_outputs=false (otherwise the dropout cannot be applied to cached embeddings).
+  # Options/Optional values: 0.0 (disabled), 0.05, 0.1
+  caption_dropout_rate: 0.0
+
+  # Probability of dropping each individual comma-separated tag.
+  # Options/Optional values: 0.0 (disabled), 0.05, 0.1
+  tag_dropout_rate: 0.0
 
 # ------------------------------------------------------------------------------
 # 3. Training Loop & Precision Configuration

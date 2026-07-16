@@ -10,11 +10,11 @@ def test_image_caption_dataset(tmp_path):
     img_dir.mkdir()
 
     # Create mock images
-    img1 = Image.new("RGB", (800, 800), color="red")
+    img1 = Image.new("RGB", (512, 512), color="red")
     img1.save(img_dir / "00001.png")
     (img_dir / "00001.txt").write_text("a red square", encoding="utf-8")
 
-    img2 = Image.new("RGB", (1200, 900), color="blue")
+    img2 = Image.new("RGB", (512, 512), color="blue")
     img2.save(img_dir / "00002.webp")
     (img_dir / "00002.txt").write_text("a blue rectangle", encoding="utf-8")
 
@@ -27,21 +27,22 @@ def test_image_caption_dataset(tmp_path):
     assert dataset.samples[1][0].name == "00002.webp"
     assert dataset.samples[1][1] == "a blue rectangle"
 
-    # Load item validation
+    # Load item validation (square image -> base bucket 512x512)
     item = dataset[0]
     assert "pixel_values" in item
     assert item["caption"] == "a red square"
     assert item["pixel_values"].shape == (3, 512, 512)
+    assert item["bucket_size"] == (512, 512)
 
-    # Test collation
+    # Test collation (same bucket -> stackable)
     batch = collate_fn([dataset[0], dataset[1]])
     assert batch["pixel_values"].shape == (2, 3, 512, 512)
     assert batch["captions"] == ["a red square", "a blue rectangle"]
 
-    # Test DataLoader helper
-    dataloader = create_dataloader(str(img_dir), batch_size=2, resolution=256, shuffle=False, num_workers=0)
+    # Test DataLoader helper (bucket-batched)
+    dataloader = create_dataloader(str(img_dir), batch_size=2, resolution=512, shuffle=False, num_workers=0)
     batch_dl = next(iter(dataloader))
-    assert batch_dl["pixel_values"].shape == (2, 3, 256, 256)
+    assert batch_dl["pixel_values"].shape == (2, 3, 512, 512)
 
 
 def test_dataset_ram_caching(tmp_path):
@@ -116,11 +117,17 @@ def test_dataset_disk_caching(tmp_path):
     mock_prompt_embeds = torch.randn(1, 77, 2048)
     mock_pooled_prompt_embeds = torch.randn(1, 1280)
 
-    torch.save(mock_latent, cache_dir / f"latent_{path_hash}.pt")
+    # New combined cache schema: cache_{hash}.pt
     torch.save({
+        "format": "sdxl-trainer-cache",
+        "version": 1,
+        "latents": mock_latent,
         "prompt_embeds": mock_prompt_embeds,
         "pooled_prompt_embeds": mock_pooled_prompt_embeds,
-    }, cache_dir / f"te_{path_hash}.pt")
+        "original_size": (128, 128),
+        "crop_ltrb": (0, 0, 0, 0),
+        "bucket_size": (128, 128),
+    }, cache_dir / f"cache_{path_hash}.pt")
 
     # Retrieve and verify
     item = dataset[0]

@@ -14,15 +14,26 @@ class ModelConfig(BaseModel):
 class DatasetConfig(BaseModel):
     path: str = Field(..., description="Path to image-caption directory.")
     batch_size: int = Field(1, description="Training batch size.")
-    resolution: int = Field(1024, description="Image resolution for training.")
+    resolution: int = Field(1024, description="Base resolution for aspect-ratio bucketing. Images are assigned to the bucket whose aspect ratio is closest to their own.")
     shuffle: bool = Field(True, description="Shuffle dataset.")
     num_workers: int = Field(4, description="Number of subprocesses for data loading.")
     cache_latents: bool = Field(True, description="Pre-computes and caches VAE latents.")
     cache_text_encoder_outputs: bool = Field(True, description="Pre-computes and caches Text Encoder outputs (only when Text Encoder is not trained).")
     cache_destination: str = Field("ram", description="Destination for caching: 'ram' or 'disk'.")
-    cache_dir: Optional[str] = Field(None, description="Custom directory for disk caching. Defaults to .cache_latents inside the dataset directory if null.")
+    cache_dir: Optional[str] = Field(None, description="Custom directory for disk caching. Defaults to a sibling '<dataset>.cache_latents' directory if null.")
     cache_workers: int = Field(8, description="Number of worker threads for parallel image loading and disk-cache reads during precaching.")
     cache_batch_size: int = Field(4, description="Number of samples encoded together on the GPU during precaching. Higher is faster but uses more VRAM.")
+
+    # Aspect-ratio bucketing
+    bucket_step: int = Field(64, description="Bucket size step in pixels. Both bucket dimensions are multiples of this (must be 8-safe for the VAE).")
+    bucket_min_size: Optional[int] = Field(None, description="Minimum bucket dimension. Defaults to bucket_step if null.")
+    bucket_max_size: Optional[int] = Field(None, description="Maximum bucket dimension. Defaults to 1.5x resolution if null.")
+
+    # Caption augmentations (Kohya-style)
+    shuffle_caption: bool = Field(False, description="Shuffle comma-separated tags (keeping the first keep_tokens fixed).")
+    keep_tokens: int = Field(0, description="Number of leading comma-separated tags to keep in place when shuffle_caption is enabled.")
+    caption_dropout_rate: float = Field(0.0, description="Probability of dropping the whole caption (empty) at training time. Requires cache_text_encoder_outputs=false.")
+    tag_dropout_rate: float = Field(0.0, description="Probability of dropping each individual comma-separated tag.")
 
     @field_validator("cache_destination")
     @classmethod

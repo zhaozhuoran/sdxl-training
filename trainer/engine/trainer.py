@@ -356,6 +356,11 @@ class SDXLTrainer:
             # Map location safely
             state = torch.load(target_path, map_location=self.device)
 
+            # Guard against resuming with a changed configuration. The checkpoint
+            # does not store the full config, so a mismatch blends old training
+            # state with new hyper-parameters (silently corrupting or crashing).
+            self._enforce_config_compatibility(state)
+
             # Load training markers
             self.global_step = state["step"]
             self.current_epoch = state["epoch"]
@@ -376,6 +381,45 @@ class SDXLTrainer:
                 torch.cuda.set_rng_state_all(rngs["torch_cuda"])
 
             logger.info(f"Successfully recovered training progress at global_step={self.global_step}, epoch={self.current_epoch}.")
+
+    def _enforce_config_compatibility(self, state: dict) -> None:
+        """
+        Blocks silent recovery when the current config differs from the one the
+        checkpoint was saved with. A mismatch blends old training state (step,
+        LoRA weights, optimizer momentum) with new hyper-parameters, which can
+        corrupt training or crash on structural changes (rank, resolution, model...).
+
+        Requires an explicit interactive confirmation to proceed with replacing
+        the old config. Aborts when no interactive input is available.
+        """
+        old_hash = (state.get("metadata") or {}).get("config_hash")
+        new_hash = self.config_hash
+        if not old_hash or old_hash == new_hash:
+            return
+
+        logger.warning("=" * 64)
+        logger.warning("CONFIG MISMATCH: the checkpoint was saved with a DIFFERENT configuration.")
+        logger.warning(f"  checkpoint config_hash: {old_hash}")
+        logger.warning(f"  current   config_hash: {new_hash}")
+        logger.warning("Resuming will DISCARD the old config and continue with the CURRENT one.")
+        logger.warning("This can corrupt training if structural params changed")
+        logger.warning("(e.g. rank, resolution, model path, dataset path, train_text_encoder).")
+        logger.warning("=" * 64)
+
+        if self.is_test_mode:
+            logger.warning("Test mode: auto-confirming config replacement (no interactive prompt).")
+            return
+
+        try:
+            answer = input(
+                "Type 'yes' to REPLACE the old config and resume, or anything else to abort: "
+            ).strip().lower()
+        except EOFError:
+            logger.error("No interactive input available; aborting resume to avoid unsafe config replacement.")
+            raise RuntimeError("Aborted: config mismatch and no confirmation provided.")
+
+        if answer != "yes":
+            raise RuntimeError("Aborted by user: config mismatch not confirmed.")
 
     def cache_dataset(self) -> None:
         """
@@ -416,81 +460,159 @@ class SDXLTrainer:
         if hasattr(self.vae, "eval"):
             self.vae.eval()
 
+        total = len(dataset)
+        cache_destination = self.config.dataset.cache_destination
+        workers = self.config.dataset.cache_workers
+        batch_size = max(1, self.config.dataset.cache_batch_size)
+        resolution = self.config.dataset.resolution
+        weight_dtype = self.weight_dtype
+        device = self.device
+        is_test_mode = self.is_test_mode
+
+        def load_item(item):
+            img_path, caption, path_hash = item
+            disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
+            disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
+
+            latents = None
+            prompt_embeds = None
+            pooled_prompt_embeds = None
+            pixel_values = None
+
+            from PIL import Image
+            if cache_latents and disk_latent_path is not None and disk_latent_path.exists():
+                latents = torch.load(disk_latent_path, map_location="cpu")
+            if cache_te and disk_te_path is not None and disk_te_path.exists():
+                te_data = torch.load(disk_te_path, map_location="cpu")
+                prompt_embeds = te_data["prompt_embeds"]
+                pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
+
+            if is_test_mode:
+                if cache_latents and latents is None:
+                    latents = torch.randn(1, 3, resolution, resolution, dtype=weight_dtype)
+                if cache_te and prompt_embeds is None:
+                    prompt_embeds = torch.randn(1, 77, 2048, dtype=weight_dtype)
+                    pooled_prompt_embeds = torch.randn(1, 1280, dtype=weight_dtype)
+            elif cache_latents and latents is None:
+                try:
+                    with Image.open(img_path) as img:
+                        image = img.convert("RGB")
+                except Exception as e:
+                    raise IOError(f"Error loading image {img_path}: {e}")
+                pixel_values = dataset.transform(image)
+
+            return {
+                "path_hash": path_hash,
+                "caption": caption,
+                "pixel_values": pixel_values,
+                "latents": latents,
+                "prompt_embeds": prompt_embeds,
+                "pooled_prompt_embeds": pooled_prompt_embeds,
+                "disk_latent_path": disk_latent_path,
+                "disk_te_path": disk_te_path,
+            }
+
+        def prefetch_samples():
+            samples = dataset.samples_with_hashes
+            if workers <= 0:
+                for s in samples:
+                    yield load_item(s)
+                return
+            from concurrent.futures import ThreadPoolExecutor
+            window = max(workers * 2, batch_size * 2)
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {}
+                submitted = 0
+                while submitted < len(samples) and len(futures) < window:
+                    f = ex.submit(load_item, samples[submitted])
+                    futures[f] = submitted
+                    submitted += 1
+                next_idx = submitted
+                while futures:
+                    f = next(iter(futures))
+                    result = f.result()
+                    del futures[f]
+                    if next_idx < len(samples):
+                        nf = ex.submit(load_item, samples[next_idx])
+                        futures[nf] = next_idx
+                        next_idx += 1
+                    yield result
+
         from tqdm import tqdm
         progress_bar = tqdm(
-            total=len(dataset),
+            total=total,
             desc="Caching dataset",
             dynamic_ncols=True
         )
+        log_every = max(1, total // 50)
+        import time
+        cache_start = time.time()
+        processed = 0
+
+        buffer: list = []
+
+        def flush():
+            nonlocal processed
+            if not buffer:
+                return
+
+            to_encode = [b for b in buffer if cache_latents and b["latents"] is None]
+            if to_encode:
+                pv = torch.stack([b["pixel_values"] for b in to_encode]).to(device, dtype=torch.float32)
+                latents_dist = self.vae.encode(pv).latent_dist
+                out = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
+                out = (out * self.vae.config.scaling_factor).to(weight_dtype).cpu()
+                for b, lat in zip(to_encode, out):
+                    b["latents"] = lat
+
+            to_te = [b for b in buffer if cache_te and b["prompt_embeds"] is None]
+            if to_te:
+                captions = [b["caption"] for b in to_te]
+                pe, ppe = self._encode_prompt(captions)
+                pe = pe.cpu()
+                ppe = ppe.cpu()
+                for b, e in zip(to_te, zip(pe, ppe)):
+                    b["prompt_embeds"] = e[0]
+                    b["pooled_prompt_embeds"] = e[1]
+
+            for b in buffer:
+                if cache_destination == "disk":
+                    if cache_latents and b["latents"] is not None and b["disk_latent_path"] is not None and not b["disk_latent_path"].exists():
+                        torch.save(b["latents"], b["disk_latent_path"])
+                    if cache_te and b["prompt_embeds"] is not None and b["disk_te_path"] is not None and not b["disk_te_path"].exists():
+                        torch.save({
+                            "prompt_embeds": b["prompt_embeds"],
+                            "pooled_prompt_embeds": b["pooled_prompt_embeds"]
+                        }, b["disk_te_path"])
+                if cache_destination == "ram":
+                    item = {}
+                    if cache_latents and b["latents"] is not None:
+                        item["latents"] = b["latents"]
+                    if cache_te and b["prompt_embeds"] is not None:
+                        item["prompt_embeds"] = b["prompt_embeds"]
+                        item["pooled_prompt_embeds"] = b["pooled_prompt_embeds"]
+                    if item:
+                        dataset.ram_cache[b["path_hash"]] = item
+
+                processed += 1
+                progress_bar.update(1)
+                if processed % log_every == 0 or processed == total:
+                    elapsed = time.time() - cache_start
+                    rate = processed / elapsed if elapsed > 0 else 0
+                    eta = (total - processed) / rate if rate > 0 else 0
+                    logger.info(
+                        f"Caching progress: {processed}/{total} "
+                        f"({rate:.2f} img/s, ETA {eta:.0f}s)"
+                    )
+            buffer.clear()
 
         try:
             with torch.no_grad():
-                for idx in range(len(dataset)):
-                    img_path, caption, path_hash = dataset.samples_with_hashes[idx]
-
-                    latents = None
-                    prompt_embeds = None
-                    pooled_prompt_embeds = None
-
-                    disk_latent_path = self.cache_dir_path / f"latent_{path_hash}.pt" if self.cache_dir_path else None
-                    disk_te_path = self.cache_dir_path / f"te_{path_hash}.pt" if self.cache_dir_path else None
-
-                    # 1. Latent calculation
-                    if cache_latents:
-                        if disk_latent_path and disk_latent_path.exists():
-                            latents = torch.load(disk_latent_path, map_location="cpu")
-                        else:
-                            if self.is_test_mode:
-                                latents = torch.randn(1, 3, self.config.dataset.resolution, self.config.dataset.resolution, dtype=self.weight_dtype)
-                            else:
-                                from PIL import Image
-                                try:
-                                    with Image.open(img_path) as img:
-                                        image = img.convert("RGB")
-                                except Exception as e:
-                                    raise IOError(f"Error loading image {img_path}: {e}")
-
-                                pixel_values = dataset.transform(image).unsqueeze(0).to(self.device, dtype=torch.float32)
-                                latents_dist = self.vae.encode(pixel_values).latent_dist
-                                latents = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
-                                latents = latents * self.vae.config.scaling_factor
-                                latents = latents.to(self.weight_dtype).cpu()
-
-                            if disk_latent_path and self.config.dataset.cache_destination == "disk":
-                                torch.save(latents, disk_latent_path)
-
-                    # 2. Text Encoder outputs calculation
-                    if cache_te:
-                        if disk_te_path and disk_te_path.exists():
-                            te_data = torch.load(disk_te_path, map_location="cpu")
-                            prompt_embeds = te_data["prompt_embeds"]
-                            pooled_prompt_embeds = te_data["pooled_prompt_embeds"]
-                        else:
-                            if self.is_test_mode:
-                                prompt_embeds = torch.randn(1, 77, 2048, dtype=self.weight_dtype)
-                                pooled_prompt_embeds = torch.randn(1, 1280, dtype=self.weight_dtype)
-                            else:
-                                pe, ppe = self._encode_prompt([caption])
-                                prompt_embeds = pe.cpu()
-                                pooled_prompt_embeds = ppe.cpu()
-
-                            if disk_te_path and self.config.dataset.cache_destination == "disk":
-                                torch.save({
-                                    "prompt_embeds": prompt_embeds,
-                                    "pooled_prompt_embeds": pooled_prompt_embeds
-                                }, disk_te_path)
-
-                    # Store in RAM cache if destination is ram
-                    if self.config.dataset.cache_destination == "ram":
-                        cache_item = {}
-                        if latents is not None:
-                            cache_item["latents"] = latents
-                        if prompt_embeds is not None:
-                            cache_item["prompt_embeds"] = prompt_embeds
-                            cache_item["pooled_prompt_embeds"] = pooled_prompt_embeds
-                        dataset.ram_cache[path_hash] = cache_item
-
-                    progress_bar.update(1)
+                for loaded in prefetch_samples():
+                    buffer.append(loaded)
+                    if len(buffer) >= batch_size:
+                        flush()
+                flush()
         finally:
             progress_bar.close()
 

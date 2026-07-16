@@ -21,6 +21,8 @@ class DatasetConfig(BaseModel):
     cache_text_encoder_outputs: bool = Field(True, description="Pre-computes and caches Text Encoder outputs (only when Text Encoder is not trained).")
     cache_destination: str = Field("ram", description="Destination for caching: 'ram' or 'disk'.")
     cache_dir: Optional[str] = Field(None, description="Custom directory for disk caching. Defaults to .cache_latents inside the dataset directory if null.")
+    cache_workers: int = Field(8, description="Number of worker threads for parallel image loading and disk-cache reads during precaching.")
+    cache_batch_size: int = Field(4, description="Number of samples encoded together on the GPU during precaching. Higher is faster but uses more VRAM.")
 
     @field_validator("cache_destination")
     @classmethod

@@ -56,6 +56,16 @@ dataset:
   # Default: null
   cache_dir: null
 
+  # Number of worker threads used to load images and read disk caches in parallel during precaching.
+  # This overlaps slow I/O (e.g. datasets on network/USB mounts) with GPU encoding.
+  # Options/Optional values: 0 (serial), 4, 8 (recommended), 16
+  cache_workers: 8
+
+  # Number of samples encoded together on the GPU during precaching (batched VAE/Text Encoder passes).
+  # Higher is faster but uses more VRAM. Keep modest unless you have spare VRAM during precaching.
+  # Options/Optional values: 1 (serial), 4 (recommended), 8, 16
+  cache_batch_size: 4
+
 # ------------------------------------------------------------------------------
 # 3. Training Loop & Precision Configuration
 # ------------------------------------------------------------------------------

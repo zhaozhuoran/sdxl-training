@@ -364,6 +364,7 @@ class SDXLTrainer:
             keep_tokens=ds.keep_tokens,
             tag_dropout_rate=ds.tag_dropout_rate,
             caption_dropout_rate=ds.caption_dropout_rate,
+            seed=self.config.training.seed,
         )
 
         logger.info(f"Setting up dataset Loader from path: {self.config.dataset.path}")
@@ -441,8 +442,17 @@ class SDXLTrainer:
                 torch.set_rng_state(rngs["torch_cpu"])
             if rngs.get("torch_cuda") is not None and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rngs["torch_cuda"])
+            if rngs.get("caption") is not None and getattr(self, "caption_processor", None) is not None:
+                self.caption_processor.set_rng_state(rngs["caption"])
 
             logger.info(f"Successfully recovered training progress at global_step={self.global_step}, epoch={self.current_epoch}.")
+
+    def _gather_rng_states(self) -> Dict[str, Any]:
+        """Captures all RNG states for checkpointing, including caption augmentation."""
+        states = self.checkpoint_manager._get_current_rng_states()
+        if getattr(self, "caption_processor", None) is not None:
+            states["caption"] = self.caption_processor.get_rng_state()
+        return states
 
     def _enforce_config_compatibility(self, state: dict) -> None:
         """
@@ -851,17 +861,19 @@ class SDXLTrainer:
     def _get_add_time_ids(
         self,
         original_sizes: List[Tuple[int, int]],
-        crop_ltrbs: List[Tuple[int, int, int, int]],
+        crop_originals: List[Tuple[int, int]],
         target_sizes: List[Tuple[int, int]],
     ) -> torch.Tensor:
         """Builds SDXL micro-conditioning IDs for a batch from real per-image metadata.
 
-        Each row is ``[orig_w, orig_h, crop_top, crop_left, target_w, target_h]`` to match
-        the SDXL/diffusers convention (crops_coords_top_left = (top, left)).
+        Each row follows the SDXL/diffusers convention
+        ``[orig_h, orig_w, crop_top, crop_left, target_h, target_w]`` using the
+        TRUE original image size and the crop offsets expressed in original-image
+        space (matching kohya / diffusers), not the resized-to-cover size.
         """
         rows = []
-        for (ow, oh), (l, t, r, b), (tw, th) in zip(original_sizes, crop_ltrbs, target_sizes):
-            rows.append([ow, oh, t, l, tw, th])
+        for (ow, oh), (t, l), (tw, th) in zip(original_sizes, crop_originals, target_sizes):
+            rows.append([oh, ow, t, l, th, tw])
         return torch.tensor(rows, device=self.device, dtype=self.weight_dtype)
 
     def train_step(self, batch: Dict[str, Any]) -> float:
@@ -935,7 +947,7 @@ class SDXLTrainer:
 
                 # 4. SDXL micro-conditioning from the REAL per-image original size / crop.
                 add_time_ids = self._get_add_time_ids(
-                    batch["original_sizes"], batch["crop_ltrbs"], batch["bucket_sizes"]
+                    batch["true_original_sizes"], batch["crop_originals"], batch["bucket_sizes"]
                 )
 
                 added_cond_kwargs = {
@@ -1073,7 +1085,8 @@ class SDXLTrainer:
                             self.lora_manager,
                             self.optimizer,
                             self.scheduler,
-                            self.grad_scaler
+                            self.grad_scaler,
+                            rng_states=self._gather_rng_states(),
                         )
                         last_recovery_time = time.time()
 
@@ -1097,7 +1110,8 @@ class SDXLTrainer:
                             self.optimizer,
                             self.scheduler,
                             self.grad_scaler,
-                            is_snapshot=True
+                            is_snapshot=True,
+                            rng_states=self._gather_rng_states(),
                         )
                         last_snapshot_time = time.time()
 

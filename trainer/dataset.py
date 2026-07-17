@@ -73,6 +73,8 @@ class ImageCaptionDataset(Dataset):
                 "bucket": assign.bucket,
                 "original_size": assign.original_size,
                 "crop_ltrb": assign.crop_ltrb,
+                "true_original_size": assign.true_original_size,
+                "crop_original": assign.crop_original,
             })
             self.bucket_of_index.append(assign.bucket)
 
@@ -120,12 +122,16 @@ class ImageCaptionDataset(Dataset):
         bucket = meta["bucket"]
         original_size = meta["original_size"]
         crop_ltrb = meta["crop_ltrb"]
+        true_original_size = meta["true_original_size"]
+        crop_original = meta["crop_original"]
 
         item: Dict[str, Any] = {
             "caption": caption,
             "image_path": str(img_path),
             "original_size": original_size,
             "crop_ltrb": crop_ltrb,
+            "true_original_size": true_original_size,
+            "crop_original": crop_original,
             "bucket_size": bucket,
         }
 
@@ -164,18 +170,37 @@ class ImageCaptionDataset(Dataset):
 def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
 
-    if "pixel_values" in examples[0]:
-        result["pixel_values"] = torch.stack([example["pixel_values"] for example in examples])
-    if "latents" in examples[0]:
-        result["latents"] = torch.stack([example["latents"].squeeze(0) for example in examples])
-    if "prompt_embeds" in examples[0]:
-        result["prompt_embeds"] = torch.stack([example["prompt_embeds"].squeeze(0) for example in examples])
-        result["pooled_prompt_embeds"] = torch.stack([example["pooled_prompt_embeds"].squeeze(0) for example in examples])
+    # Each optional tensor key must be present in EVERY sample of the batch or in
+    # NONE. BucketBatchSampler groups by bucket, so spatial sizes match, but cache
+    # status is per-sample; a mixed batch (some cached, some not) is unsupported
+    # and must fail loudly instead of raising a cryptic KeyError during stacking.
+    tensor_keys = {
+        "pixel_values": False,
+        "latents": True,
+        "prompt_embeds": True,
+        "pooled_prompt_embeds": True,
+    }
+    for key, squeeze in tensor_keys.items():
+        present = [ex for ex in examples if key in ex]
+        if not present:
+            continue
+        if len(present) != len(examples):
+            raise ValueError(
+                f"Collate inconsistency: '{key}' present in {len(present)}/{len(examples)} "
+                f"samples of a batch. Mixed cached/uncached samples in one batch are not supported; "
+                f"ensure the dataset is fully cached before training."
+            )
+        if squeeze:
+            result[key] = torch.stack([ex[key].squeeze(0) for ex in examples])
+        else:
+            result[key] = torch.stack([ex[key] for ex in examples])
 
     result["captions"] = [example["caption"] for example in examples]
     result["image_paths"] = [example["image_path"] for example in examples]
     result["original_sizes"] = [example["original_size"] for example in examples]
     result["crop_ltrbs"] = [example["crop_ltrb"] for example in examples]
+    result["true_original_sizes"] = [example["true_original_size"] for example in examples]
+    result["crop_originals"] = [example["crop_original"] for example in examples]
     result["bucket_sizes"] = [example["bucket_size"] for example in examples]
 
     return result

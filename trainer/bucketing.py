@@ -27,8 +27,10 @@ from torch.utils.data import Sampler
 @dataclass
 class BucketAssignment:
     bucket: Tuple[int, int]          # (width, height) exact target size
-    original_size: Tuple[int, int]   # (width, height) after resize, before crop
-    crop_ltrb: Tuple[int, int, int, int]  # (left, top, right, bottom)
+    original_size: Tuple[int, int]   # (width, height) after resize-to-cover, before crop (used for pixel transform)
+    crop_ltrb: Tuple[int, int, int, int]  # (left, top, right, bottom) crop within the resized image (pixel transform)
+    true_original_size: Tuple[int, int]   # (width, height) actual image size (SDXL conditioning)
+    crop_original: Tuple[int, int]         # (top, left) crop offsets in ORIGINAL image space (SDXL conditioning)
 
 
 def make_buckets(
@@ -122,10 +124,18 @@ def compute_bucket_assignment(
     right = rw - bw - left
     bottom = rh - bh - top
 
+    # Crop offsets expressed in the ORIGINAL image's coordinate space (the
+    # convention SDXL / diffusers expect for add_time_ids), rather than in the
+    # resized-to-cover space used for the pixel transform above.
+    crop_top_orig = round(top / scale)
+    crop_left_orig = round(left / scale)
+
     return BucketAssignment(
         bucket=(bw, bh),
         original_size=(rw, rh),
         crop_ltrb=(left, top, right, bottom),
+        true_original_size=(iw, ih),
+        crop_original=(crop_top_orig, crop_left_orig),
     )
 
 

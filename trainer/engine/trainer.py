@@ -246,6 +246,19 @@ class SDXLTrainer:
         self.unet.to(self.device)
         self.unet.requires_grad_(False)
 
+        if self.config.training.gradient_checkpointing:
+            self.unet.enable_gradient_checkpointing()
+
+        try:
+            self.unet.enable_xformers_memory_efficient_attention()
+            logger.info("xFormers memory-efficient attention enabled on UNet.")
+        except Exception as e:
+            logger.warning(
+                "xFormers unavailable (%s); falling back to diffusers' default SDPA attention. "
+                "Install xformers (matching the installed torch) for lower attention memory.",
+                e,
+            )
+
     def setup_lora(self) -> None:
         """Injects generic parameter-efficient LoRA wrapper modules into model components."""
         logger.info("Injecting customizable parameter-efficient LoRA layers...")
@@ -488,6 +501,11 @@ class SDXLTrainer:
             )
             cache_te = False
 
+        # Record which outputs are actually cached so the training loop can
+        # offload the now-unused VAE / Text Encoders to free GPU memory.
+        self._latents_cached = cache_latents
+        self._te_cached = cache_te
+
         if not cache_latents and not cache_te:
             return
 
@@ -531,8 +549,50 @@ class SDXLTrainer:
         if hasattr(self.vae, "eval"):
             self.vae.eval()
 
-        total = len(dataset)
         cache_destination = self.config.dataset.cache_destination
+
+        # --- Pre-scan: decide which samples actually need GPU encoding ---
+        # A sample needs encoding if its on-disk cache is missing or invalid for any
+        # of the enabled outputs (latents / text-encoder embeddings). Fully-cached
+        # samples are excluded from the encode loop entirely, so the progress bar and
+        # ETA reflect only real VAE / Text Encoder work from the very first batch.
+        # For RAM caching, fully-cached payloads are loaded straight into ram_cache
+        # during this scan (a single read), avoiding a second load in the loop.
+        to_encode = []
+        for (img_path, caption, path_hash) in dataset.samples_with_hashes:
+            meta = meta_by_hash[path_hash]
+            expected_latent = (4, meta["bucket"][1] // 8, meta["bucket"][0] // 8)
+            disk_path = self.cache_dir_path / f"cache_{path_hash}.pt"
+
+            latents_ok = False
+            te_ok = False
+            cached = None
+            if disk_path.exists():
+                try:
+                    cached = torch.load(disk_path, map_location="cpu")
+                except Exception:
+                    cached = {}
+                if cache_latents and cached.get("latents") is not None:
+                    if tuple(cached["latents"].shape)[1:] == expected_latent[1:]:
+                        latents_ok = True
+                if cache_te and cached.get("prompt_embeds") is not None:
+                    te_ok = True
+
+            needs = (cache_latents and not latents_ok) or (cache_te and not te_ok)
+            if needs:
+                to_encode.append((img_path, caption, path_hash))
+            elif cache_destination == "ram" and cached:
+                # Fully cached: populate RAM cache directly from the scanned payload.
+                item_cache = {}
+                if cache_latents and cached.get("latents") is not None:
+                    item_cache["latents"] = cached["latents"]
+                if cache_te and cached.get("prompt_embeds") is not None:
+                    item_cache["prompt_embeds"] = cached["prompt_embeds"]
+                    item_cache["pooled_prompt_embeds"] = cached.get("pooled_prompt_embeds")
+                if item_cache:
+                    dataset.ram_cache[path_hash] = item_cache
+
+        total = len(to_encode)
         workers = self.config.dataset.cache_workers
         batch_size = max(1, self.config.dataset.cache_batch_size)
         resolution = self.config.dataset.resolution
@@ -591,14 +651,6 @@ class SDXLTrainer:
             # outputs are being cached; otherwise left as-is (unused downstream).
             processed_caption = self.caption_processor.process(caption) if cache_te else caption
 
-            # Whether this sample still requires GPU work. Already-cached samples
-            # (read from disk) are instant and must NOT count toward the progress
-            # bar / ETA, which should only reflect real VAE / Text Encoder encodes.
-            if is_test_mode:
-                needs_encode = True
-            else:
-                needs_encode = (cache_latents and latents is None) or (cache_te and prompt_embeds is None)
-
             return {
                 "path_hash": path_hash,
                 "caption": caption,
@@ -607,15 +659,13 @@ class SDXLTrainer:
                 "latents": latents,
                 "prompt_embeds": prompt_embeds,
                 "pooled_prompt_embeds": pooled_prompt_embeds,
-                "needs_encode": needs_encode,
                 "bucket": bucket,
                 "original_size": original_size,
                 "crop_ltrb": crop_ltrb,
                 "disk_path": disk_path,
             }
 
-        def prefetch_samples():
-            samples = dataset.samples_with_hashes
+        def prefetch_samples(samples):
             if workers <= 0:
                 for s in samples:
                     yield load_item(s)
@@ -648,13 +698,7 @@ class SDXLTrainer:
             desc="Caching dataset",
             dynamic_ncols=True
         )
-        log_every = max(1, total // 50)
-        import time
-        cache_start = time.time()
         processed = 0
-        # Count of samples that actually require GPU encoding. Already-cached
-        # samples (instant disk reads) are excluded from the progress bar and ETA.
-        total_to_encode = 0
 
         buffer: list = []
 
@@ -666,9 +710,9 @@ class SDXLTrainer:
             # Latents must be encoded per-bucket (each bucket has its own spatial size),
             # so group the GPU encode by bucket before stacking.
             from collections import defaultdict
-            to_encode = [b for b in buffer if cache_latents and b["latents"] is None]
+            to_encode_latents = [b for b in buffer if cache_latents and b["latents"] is None]
             groups = defaultdict(list)
-            for b in to_encode:
+            for b in to_encode_latents:
                 groups[b["bucket"]].append(b)
             for _bucket, grp in groups.items():
                 pv = torch.stack([x["pixel_values"] for x in grp]).to(device, dtype=self.vae.dtype)
@@ -718,20 +762,8 @@ class SDXLTrainer:
                     if item:
                         dataset.ram_cache[b["path_hash"]] = item
 
-                # Only advance the progress bar / ETA for samples that actually
-                # required GPU encoding; cached reads are excluded so the bar and
-                # ETA reflect real VAE / Text Encoder work only.
-                if b["needs_encode"]:
-                    processed += 1
-                    progress_bar.update(1)
-                    if processed % log_every == 0 or processed == progress_bar.total:
-                        elapsed = time.time() - cache_start
-                        rate = processed / elapsed if elapsed > 0 else 0
-                        eta = (progress_bar.total - processed) / rate if rate > 0 else 0
-                        logger.info(
-                            f"Caching progress: {processed}/{progress_bar.total} "
-                            f"({rate:.2f} img/s, ETA {eta:.0f}s)"
-                        )
+                processed += 1
+                progress_bar.update(1)
             buffer.clear()
 
             # Reclaim freed GPU memory after each flush() so the CUDA caching
@@ -746,12 +778,7 @@ class SDXLTrainer:
 
         try:
             with torch.no_grad():
-                for loaded in prefetch_samples():
-                    # Tally real GPU work as it streams in so the progress bar
-                    # total reflects only encodes, not cached reads.
-                    if loaded["needs_encode"]:
-                        total_to_encode += 1
-                        progress_bar.total = total_to_encode
+                for loaded in prefetch_samples(to_encode):
                     buffer.append(loaded)
                     if len(buffer) >= batch_size:
                         flush()
@@ -759,10 +786,25 @@ class SDXLTrainer:
         finally:
             progress_bar.close()
 
-        if total_to_encode == 0:
+        if total == 0:
             logger.info("All dataset outputs already cached; no GPU encoding required.")
 
         logger.info("Dataset caching completed successfully.")
+
+    def _offload_unused_models(self) -> None:
+        """Moves models that are fully cached and not trained off the GPU.
+
+        During the training loop, cached latents/TE outputs are read straight
+        from the dataset, so the VAE and Text Encoders are never invoked. Leaving
+        them resident on the GPU wastes ~1.5-2GB of VRAM (kohya offloads them).
+        They are moved back to the device on demand inside train_step if a
+        non-cached path is actually taken.
+        """
+        if getattr(self, "_latents_cached", False):
+            self.vae.to("cpu")
+        if getattr(self, "_te_cached", False):
+            self.text_encoder_1.to("cpu")
+            self.text_encoder_2.to("cpu")
 
     def _encode_prompt(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -856,6 +898,8 @@ class SDXLTrainer:
                 if "latents" in batch:
                     latents = batch["latents"].to(self.device, dtype=dtype)
                 else:
+                    if self.vae.device != self.device:
+                        self.vae.to(self.device)
                     pixel_values = batch["pixel_values"].to(self.device, dtype=self.vae.dtype)
                     # Pass through standard VAE to extract latents
                     latents = self.vae.encode(pixel_values).latent_dist.sample()
@@ -881,6 +925,9 @@ class SDXLTrainer:
                 else:
                     # Text Encoder outputs are not cached (e.g. caption dropout enabled):
                     # process captions fresh, applying whole-caption dropout per step.
+                    if self.text_encoder_1.device != self.device:
+                        self.text_encoder_1.to(self.device)
+                        self.text_encoder_2.to(self.device)
                     captions = [self.caption_processor.maybe_drop_caption(c) for c in batch["captions"]]
                     prompt_embeds, pooled_prompt_embeds = self._encode_prompt(captions)
                     prompt_embeds = prompt_embeds.to(dtype)
@@ -943,6 +990,11 @@ class SDXLTrainer:
 
         # Resume state if required
         self.handle_resume()
+
+        # Offload VAE / Text Encoders that are fully cached and not trained; they
+        # are unused during the training loop and only consume resident VRAM.
+        if torch.cuda.is_available():
+            self._offload_unused_models()
 
         # Main Loop
         last_recovery_time = time.time()

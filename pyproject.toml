@@ -18,6 +18,12 @@ dependencies = [
     "tqdm>=4.65.0"
 ]
 
+[project.optional-dependencies]
+# Optional memory-efficient attention backend for the UNet. Pinned to the build
+# that matches the locked torch==2.5.1. The trainer falls back to diffusers'
+# default SDPA attention when xformers is not installed.
+xformers = ["xformers==0.0.28.post3"]
+
 [project.scripts]
 sdxl-train = "train:main"
 

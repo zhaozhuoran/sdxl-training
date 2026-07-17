@@ -13,3 +13,8 @@ pillow==11.0.0
 tqdm==4.67.1
 numpy==1.26.4
 bitsandbytes==0.45.2
+
+# Optional but recommended: memory-efficient attention (FlashAttention-style) for the UNet.
+# The trainer enables it when present and otherwise falls back to SDPA (diffusers default).
+# Pinned to the build matching the locked torch==2.5.1.
+xformers==0.0.28.post3

@@ -1,4 +1,5 @@
 import os
+import gc
 import time
 import shutil
 import hashlib
@@ -163,6 +164,11 @@ class SDXLTrainer:
             self.tokenizer_1 = pipe.tokenizer
             self.tokenizer_2 = pipe.tokenizer_2
             self.noise_scheduler = pipe.scheduler
+            # The full pipeline (incl. the UNet, which stays on CPU) is no longer
+            # needed once components are extracted. Drop it explicitly so the
+            # host-memory it holds (UNet weights, etc.) is reclaimed promptly.
+            del pipe
+            gc.collect()
         else:
             self.text_encoder_1 = CLIPTextModel.from_pretrained(model_path, subfolder="text_encoder", torch_dtype=self.weight_dtype)
             self.text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(model_path, subfolder="text_encoder_2", torch_dtype=self.weight_dtype)
@@ -176,10 +182,23 @@ class SDXLTrainer:
             self.tokenizer_1 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer", use_fast=False)
             self.tokenizer_2 = AutoTokenizer.from_pretrained(model_path, subfolder="tokenizer_2", use_fast=False)
 
+        # VAE is encoded in float32 during caching. Slicing caps the per-batch
+        # activation peak but serializes the batch into per-sample passes (slower).
+        # It is off by default (speed-first); enable via dataset.cache_vae_slicing
+        # on VRAM-constrained GPUs. Peak VRAM is reclaimed each batch regardless
+        # via torch.cuda.empty_cache() in cache_dataset.
+        if self.config.dataset.cache_vae_slicing:
+            self.vae.enable_slicing()
+
         # Place VAE + Text Encoders on active device
         self.text_encoder_1.to(self.device)
         self.text_encoder_2.to(self.device)
         self.vae.to(self.device)
+
+        # Reclaim the transient peak from model loading (and, for single-file
+        # checkpoints, from building the full pipeline) before the cache phase.
+        gc.collect()
+        torch.cuda.empty_cache()
 
         # Freeze original models
         self.text_encoder_1.requires_grad_(False)
@@ -213,11 +232,15 @@ class SDXLTrainer:
         logger.info(f"Loading UNet from: {model_path}")
         is_single_file = os.path.isfile(model_path) and model_path.lower().endswith((".safetensors", ".ckpt"))
         if is_single_file:
-            from diffusers import StableDiffusionXLPipeline
-            pipe = StableDiffusionXLPipeline.from_single_file(
+            # Load ONLY the UNet from the single-file checkpoint. Using
+            # UNet2DConditionModel.from_single_file avoids rebuilding the entire
+            # StableDiffusionXLPipeline (text encoders, VAE, tokenizers,
+            # scheduler) just to grab pipe.unet -- that full pipeline is already
+            # loaded (and discarded) in setup_models, so re-instantiating it
+            # here would double the single-file load cost.
+            self.unet = UNet2DConditionModel.from_single_file(
                 model_path, torch_dtype=self.weight_dtype, local_files_only=True
             )
-            self.unet = pipe.unet
         else:
             self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet", torch_dtype=self.weight_dtype)
         self.unet.to(self.device)
@@ -562,13 +585,29 @@ class SDXLTrainer:
                     raise IOError(f"Error loading image {img_path}: {e}")
                 pixel_values = dataset._transform(image, meta)
 
+            # Pre-compute caption augmentation (tag shuffle / dropout) here, in the
+            # prefetch thread, so the GPU encode path only tokenizes + encodes and
+            # the main thread never stalls on CPU caption work. Only needed when TE
+            # outputs are being cached; otherwise left as-is (unused downstream).
+            processed_caption = self.caption_processor.process(caption) if cache_te else caption
+
+            # Whether this sample still requires GPU work. Already-cached samples
+            # (read from disk) are instant and must NOT count toward the progress
+            # bar / ETA, which should only reflect real VAE / Text Encoder encodes.
+            if is_test_mode:
+                needs_encode = True
+            else:
+                needs_encode = (cache_latents and latents is None) or (cache_te and prompt_embeds is None)
+
             return {
                 "path_hash": path_hash,
                 "caption": caption,
+                "processed_caption": processed_caption,
                 "pixel_values": pixel_values,
                 "latents": latents,
                 "prompt_embeds": prompt_embeds,
                 "pooled_prompt_embeds": pooled_prompt_embeds,
+                "needs_encode": needs_encode,
                 "bucket": bucket,
                 "original_size": original_size,
                 "crop_ltrb": crop_ltrb,
@@ -582,7 +621,9 @@ class SDXLTrainer:
                     yield load_item(s)
                 return
             from concurrent.futures import ThreadPoolExecutor
-            window = max(workers * 2, batch_size * 2)
+            # Keep a deeper prefetch window than the encode batch so the GPU never
+            # idles between flushes waiting on CPU image decode / disk-cache reads.
+            window = max(workers * 2, batch_size * 4)
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futures = {}
                 submitted = 0
@@ -611,6 +652,9 @@ class SDXLTrainer:
         import time
         cache_start = time.time()
         processed = 0
+        # Count of samples that actually require GPU encoding. Already-cached
+        # samples (instant disk reads) are excluded from the progress bar and ETA.
+        total_to_encode = 0
 
         buffer: list = []
 
@@ -636,8 +680,9 @@ class SDXLTrainer:
 
             to_te = [b for b in buffer if cache_te and b["prompt_embeds"] is None]
             if to_te:
-                # Apply caption augmentation (tag shuffle / dropout) when encoding.
-                captions = [self.caption_processor.process(b["caption"]) for b in to_te]
+                # Caption augmentation was already applied in the prefetch thread
+                # (item["processed_caption"]), so here we only tokenize + encode.
+                captions = [b["processed_caption"] for b in to_te]
                 pe, ppe = self._encode_prompt(captions)
                 pe = pe.cpu()
                 ppe = ppe.cpu()
@@ -673,27 +718,49 @@ class SDXLTrainer:
                     if item:
                         dataset.ram_cache[b["path_hash"]] = item
 
-                processed += 1
-                progress_bar.update(1)
-                if processed % log_every == 0 or processed == total:
-                    elapsed = time.time() - cache_start
-                    rate = processed / elapsed if elapsed > 0 else 0
-                    eta = (total - processed) / rate if rate > 0 else 0
-                    logger.info(
-                        f"Caching progress: {processed}/{total} "
-                        f"({rate:.2f} img/s, ETA {eta:.0f}s)"
-                    )
+                # Only advance the progress bar / ETA for samples that actually
+                # required GPU encoding; cached reads are excluded so the bar and
+                # ETA reflect real VAE / Text Encoder work only.
+                if b["needs_encode"]:
+                    processed += 1
+                    progress_bar.update(1)
+                    if processed % log_every == 0 or processed == progress_bar.total:
+                        elapsed = time.time() - cache_start
+                        rate = processed / elapsed if elapsed > 0 else 0
+                        eta = (progress_bar.total - processed) / rate if rate > 0 else 0
+                        logger.info(
+                            f"Caching progress: {processed}/{progress_bar.total} "
+                            f"({rate:.2f} img/s, ETA {eta:.0f}s)"
+                        )
             buffer.clear()
+
+            # Reclaim freed GPU memory after each flush() so the CUDA caching
+            # allocator returns blocks to the driver instead of growing reserved
+            # memory monotonically. A single flush may encode several buckets of
+            # different sizes, whose varying-shape activations are the main source
+            # of allocator fragmentation (mirrors kohya's clean_memory_on_device
+            # called after each cache batch).
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
 
         try:
             with torch.no_grad():
                 for loaded in prefetch_samples():
+                    # Tally real GPU work as it streams in so the progress bar
+                    # total reflects only encodes, not cached reads.
+                    if loaded["needs_encode"]:
+                        total_to_encode += 1
+                        progress_bar.total = total_to_encode
                     buffer.append(loaded)
                     if len(buffer) >= batch_size:
                         flush()
                 flush()
         finally:
             progress_bar.close()
+
+        if total_to_encode == 0:
+            logger.info("All dataset outputs already cached; no GPU encoding required.")
 
         logger.info("Dataset caching completed successfully.")
 

@@ -22,7 +22,8 @@ class DatasetConfig(BaseModel):
     cache_destination: str = Field("ram", description="Destination for caching: 'ram' or 'disk'.")
     cache_dir: Optional[str] = Field(None, description="Custom directory for disk caching. Defaults to a sibling '<dataset>.cache_latents' directory if null.")
     cache_workers: int = Field(8, description="Number of worker threads for parallel image loading and disk-cache reads during precaching.")
-    cache_batch_size: int = Field(4, description="Number of samples encoded together on the GPU during precaching. Higher is faster but uses more VRAM.")
+    cache_batch_size: int = Field(2, description="Number of samples encoded together on the GPU during precaching. Higher is faster (better GPU utilization) but uses more peak VRAM; freed each batch via torch.cuda.empty_cache().")
+    cache_vae_slicing: bool = Field(False, description="Slice the VAE encode to cap peak VRAM during precaching. Default off (speed-first); enable on VRAM-constrained GPUs. Peak VRAM is still reclaimed each batch via torch.cuda.empty_cache() regardless.")
 
     # Aspect-ratio bucketing
     bucket_step: int = Field(64, description="Bucket size step in pixels. Both bucket dimensions are multiples of this (must be 8-safe for the VAE).")

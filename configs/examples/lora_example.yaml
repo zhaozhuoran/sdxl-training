@@ -65,9 +65,14 @@ dataset:
   cache_workers: 8
 
   # Number of samples encoded together on the GPU during precaching (batched VAE/Text Encoder passes).
-  # Higher is faster but uses more VRAM. Keep modest unless you have spare VRAM during precaching.
-  # Options/Optional values: 1 (serial), 4 (recommended), 8, 16
-  cache_batch_size: 4
+  # Higher is faster (better GPU utilization) but uses more peak VRAM; freed each batch via torch.cuda.empty_cache().
+  # Options/Optional values: 1 (serial), 2 (default), 4, 8, 16
+  cache_batch_size: 2
+
+  # Slice the VAE encode to cap peak VRAM during precaching. Default off (speed-first);
+  # enable (true) on VRAM-constrained GPUs. Peak VRAM is reclaimed each batch regardless.
+  # Options/Optional values: false (default, faster), true (lower peak VRAM)
+  cache_vae_slicing: false
 
   # --- Aspect-ratio bucketing ---
   # Images are assigned to the bucket whose aspect ratio is closest to their own,

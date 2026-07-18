@@ -44,59 +44,22 @@ sdxl-training/
 
 ## Getting Started
 
-### Environment Setup
+Full, step-by-step setup and usage instructions (environment, installation, dataset preparation, configuration, and running training) are documented in **[`USAGE.md`](./USAGE.md)**.
 
-It is strongly recommended to run this project inside a **dedicated virtual environment** so that the pinned dependency set does not conflict with other projects. Using Conda:
-
-```bash
-conda create -n sdxl-training python==3.11.13
-conda activate sdxl-training
-```
-
-All following installation steps must be executed inside this activated `sdxl-training` environment.
-
-### Installation
-
-1. Install the pinned, reproducible dependency set. Every version is locked to a single exact release in `requirements.txt` to guarantee a stable, deterministic environment:
-    ```bash
-    pip install -r requirements.txt
-    ```
-2. Build and install the toolkit in editable mode:
-    ```bash
-    pip install -e .
-    ```
-
-### Dataset Structure
-
-The MVP supports the common image-caption directory format. Each training image should have a corresponding UTF-8 encoded `.txt` caption file with the same filename.
-
-```
-dataset/
-    00001.png
-    00001.txt
-    00002.webp
-    00002.txt
-```
-
-### Running Training
-
-To run training with a structured config file:
+Quick start:
 
 ```bash
-python train.py configs/examples/lora_example.yaml
-```
-
-To run verification unit or integration tests on CPU (e.g., in testing environments without an active GPU):
-
-```bash
-python train.py configs/examples/lora_example.yaml --test-mode
+pip install -r requirements.txt
+pip install -e .
+cp configs/examples/lora_example.yaml my_config.yaml
+python train.py my_config.yaml
 ```
 
 ---
 
 ## Configuration Reference
 
-The training run is controlled entirely by the modular YAML file. An example with explanations of keys can be found in `configs/examples/lora_example.yaml`.
+The training run is controlled entirely by the modular YAML file. An example with explanations of keys can be found in `configs/examples/lora_example.yaml`, and a complete walkthrough is in [`USAGE.md`](./USAGE.md).
 
 ---
 

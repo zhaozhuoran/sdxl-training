@@ -92,5 +92,23 @@ def export_kohya_safetensors(
     for k, v in converted_dict.items():
         output_dict[k] = v.contiguous()
 
+    # Enrich the safetensors __metadata__ header with kohya-standard keys so that
+    # ecosystem tools (sd-webui, ComfyUI, kohya utilities) correctly recognize this
+    # as an SDXL LoRA and scale it properly. Rank is read from a lora_down weight.
+    rank = None
+    for k, v in lora_state_dict.items():
+        if k.endswith(".lora_down.weight"):
+            rank = v.shape[0]
+            break
+    kohya_metadata = {
+        "ss_base_model_version": "sdxl",
+        "ss_network_module": "networks.lora",
+        "ss_network_type": "lora",
+        "ss_network_dim": str(rank),
+        "ss_network_alpha": str(alpha),
+    }
+    if metadata:
+        kohya_metadata.update(metadata)
+
     # Save to disk using safetensors library
-    save_file(output_dict, output_filepath, metadata=metadata)
+    save_file(output_dict, output_filepath, metadata=kohya_metadata)

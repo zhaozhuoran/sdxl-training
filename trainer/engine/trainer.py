@@ -1053,11 +1053,13 @@ class SDXLTrainer:
                         # Calculate step time
                         step_duration = time.time() - step_start_time
 
-                        # Structured step logging
-                        logger.info(
-                            f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
-                            f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s"
-                        )
+                        # Structured step logging (throttled: one line per 1k steps;
+                        # the tqdm bar still updates every step for live progress)
+                        if self.global_step % 1000 == 0:
+                            logger.info(
+                                f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
+                                f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s"
+                            )
 
                         # Update tqdm progress bar with postfix metadata
                         progress_bar.set_postfix({

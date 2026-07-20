@@ -428,9 +428,20 @@ class SDXLTrainer:
             self.global_step = state["step"]
             self.current_epoch = state["epoch"]
 
-            # Load lora, optimizer, scheduler, scaler
+            # Load lora weights (always present)
             self.lora_manager.load_lora_state_dict(state["lora_state_dict"])
-            self.optimizer.load_state_dict(state["optimizer_state_dict"])
+
+            # Optimizer/scheduler/scaler are only stored in full snapshots.
+            # Rolling recovery checkpoints omit them, so resuming from one
+            # rebuilds optimizer momentum & LR schedule from scratch.
+            if "optimizer_state_dict" in state:
+                self.optimizer.load_state_dict(state["optimizer_state_dict"])
+            else:
+                logger.warning(
+                    "Checkpoint has no optimizer state (rolling recovery). "
+                    "Resuming with a freshly initialized optimizer; momentum/LR "
+                    "schedule restart from the configured values."
+                )
             if self.scheduler and state.get("scheduler_state_dict"):
                 self.scheduler.load_state_dict(state["scheduler_state_dict"])
             if self.grad_scaler and state.get("grad_scaler_state_dict"):
@@ -881,8 +892,11 @@ class SDXLTrainer:
         Executes a single step forward and backward pass.
         Implements actual custom SDXL LoRA noise prediction loss.
         """
-        # Optimize gradient zeroing by setting to none
-        self.optimizer.zero_grad(set_to_none=True)
+        # Gradient accumulation: only clear gradients at the start of an
+        # accumulation window so they accumulate across micro-steps.
+        acc_steps = max(1, int(self.config.training.gradient_accumulation_steps))
+        if self.global_step % acc_steps == 0:
+            self.optimizer.zero_grad(set_to_none=True)
 
         # Mixed precision compute context
         mp_type = self.config.training.mixed_precision.lower()
@@ -966,17 +980,27 @@ class SDXLTrainer:
                 # 6. L2 Loss
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
-        # Accumulation handling and scaling
+        # Scale the loss so gradients average correctly over the accumulation
+        # window, then accumulate. The optimizer/scheduler only advance at the
+        # end of a window (or on the very last step) to honor accumulation.
+        scaled_loss = loss / acc_steps
         if self.grad_scaler:
-            self.grad_scaler.scale(loss).backward()
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
+            self.grad_scaler.scale(scaled_loss).backward()
         else:
-            loss.backward()
-            self.optimizer.step()
+            scaled_loss.backward()
 
-        if self.scheduler:
-            self.scheduler.step()
+        is_window_end = (
+            (self.global_step + 1) % acc_steps == 0
+            or (self.global_step + 1) >= self.config.training.steps
+        )
+        if is_window_end:
+            if self.grad_scaler:
+                self.grad_scaler.step(self.optimizer)
+                self.grad_scaler.update()
+            else:
+                self.optimizer.step()
+            if self.scheduler:
+                self.scheduler.step()
 
         return loss.item()
 
@@ -1068,54 +1092,54 @@ class SDXLTrainer:
                         })
                         progress_bar.update(1)
 
-                    # Recovery Checkpoint Policy by Steps or Time
-                    time_since_recovery = time.time() - last_recovery_time
-                    trigger_step = (
-                        self.config.checkpoint.save_every_steps
-                        and self.global_step % self.config.checkpoint.save_every_steps == 0
-                    )
-                    trigger_time = (
-                        self.config.checkpoint.save_every_seconds
-                        and time_since_recovery >= self.config.checkpoint.save_every_seconds
-                    )
-
-                    if trigger_step or trigger_time:
-                        logger.info(f"Triggering rolling recovery checkpoint at step={self.global_step}...")
-                        self.checkpoint_manager.save_checkpoint(
-                            self.global_step,
-                            self.current_epoch,
-                            self.lora_manager,
-                            self.optimizer,
-                            self.scheduler,
-                            self.grad_scaler,
-                            rng_states=self._gather_rng_states(),
+                        # Recovery Checkpoint Policy by Steps or Time
+                        time_since_recovery = time.time() - last_recovery_time
+                        trigger_step = (
+                            self.config.checkpoint.save_every_steps
+                            and self.global_step % self.config.checkpoint.save_every_steps == 0
                         )
-                        last_recovery_time = time.time()
-
-                    # Snapshot Checkpoint Policy by Steps or Time (measured completely independently of recovery triggers)
-                    time_since_snapshot = time.time() - last_snapshot_time
-                    trigger_snap_step = (
-                        self.config.checkpoint.snapshot_every_steps
-                        and self.global_step % self.config.checkpoint.snapshot_every_steps == 0
-                    )
-                    trigger_snap_time = (
-                        self.config.checkpoint.snapshot_every_seconds
-                        and time_since_snapshot >= self.config.checkpoint.snapshot_every_seconds
-                    )
-
-                    if trigger_snap_step or trigger_snap_time:
-                        logger.info(f"Triggering long-term snapshot checkpoint at step={self.global_step}...")
-                        self.checkpoint_manager.save_checkpoint(
-                            self.global_step,
-                            self.current_epoch,
-                            self.lora_manager,
-                            self.optimizer,
-                            self.scheduler,
-                            self.grad_scaler,
-                            is_snapshot=True,
-                            rng_states=self._gather_rng_states(),
+                        trigger_time = (
+                            self.config.checkpoint.save_every_seconds
+                            and time_since_recovery >= self.config.checkpoint.save_every_seconds
                         )
-                        last_snapshot_time = time.time()
+
+                        if trigger_step or trigger_time:
+                            logger.info(f"Triggering rolling recovery checkpoint at step={self.global_step}...")
+                            self.checkpoint_manager.save_checkpoint(
+                                self.global_step,
+                                self.current_epoch,
+                                self.lora_manager,
+                                self.optimizer,
+                                self.scheduler,
+                                self.grad_scaler,
+                                rng_states=self._gather_rng_states(),
+                            )
+                            last_recovery_time = time.time()
+
+                        # Snapshot Checkpoint Policy by Steps or Time (measured completely independently of recovery triggers)
+                        time_since_snapshot = time.time() - last_snapshot_time
+                        trigger_snap_step = (
+                            self.config.checkpoint.snapshot_every_steps
+                            and self.global_step % self.config.checkpoint.snapshot_every_steps == 0
+                        )
+                        trigger_snap_time = (
+                            self.config.checkpoint.snapshot_every_seconds
+                            and time_since_snapshot >= self.config.checkpoint.snapshot_every_seconds
+                        )
+
+                        if trigger_snap_step or trigger_snap_time:
+                            logger.info(f"Triggering long-term snapshot checkpoint at step={self.global_step}...")
+                            self.checkpoint_manager.save_checkpoint(
+                                self.global_step,
+                                self.current_epoch,
+                                self.lora_manager,
+                                self.optimizer,
+                                self.scheduler,
+                                self.grad_scaler,
+                                is_snapshot=True,
+                                rng_states=self._gather_rng_states(),
+                            )
+                            last_snapshot_time = time.time()
 
                 # End of epoch telemetry
                 avg_loss = epoch_loss / max(1, step_count)
@@ -1123,6 +1147,8 @@ class SDXLTrainer:
                 self.current_epoch += 1
         finally:
             progress_bar.close()
+            # Flush any pending background checkpoint writes before exiting.
+            self.checkpoint_manager.shutdown()
 
         # Post training: Export final LoRA safetensors to lora directory
         logger.info("Training completed successfully. Exporting final compatible LoRA safetensors...")

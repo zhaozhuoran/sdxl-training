@@ -1,12 +1,17 @@
 import os
 import time
 import json
+import threading
+import queue
 import torch
 import shutil
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from trainer.config import TrainingPipelineConfig, load_config
+from trainer.logging import get_logger
 from trainer.methods.lora.injection import LoRAInjectionManager
+
+logger = get_logger()
 
 
 class CheckpointManager:
@@ -51,6 +56,104 @@ class CheckpointManager:
 
         self._create_directories()
 
+        # Background worker that serializes checkpoints off the training thread
+        # so that disk I/O (and the duplicate "latest" copy) never blocks a step.
+        self._save_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
+        self._worker_thread = threading.Thread(
+            target=self._save_worker, name="checkpoint-writer", daemon=True
+        )
+        self._worker_thread.start()
+
+    @staticmethod
+    def _to_cpu(obj: Any) -> Any:
+        """
+        Recursively detach, move to CPU and clone every tensor so the snapshot
+        is fully decoupled from GPU memory (avoids GPU OOM) and from subsequent
+        in-place training updates. Non-tensor leaves are returned untouched.
+        """
+        if isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().clone()
+        if isinstance(obj, dict):
+            return {k: CheckpointManager._to_cpu(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(CheckpointManager._to_cpu(v) for v in obj)
+        return obj
+
+    def _enqueue_save(self, step: int, is_snapshot: bool, state: Dict[str, Any]) -> None:
+        """Hand a fully CPU-resident snapshot to the background writer."""
+        self._save_queue.put({
+            "step": step,
+            "is_snapshot": is_snapshot,
+            "state": state,
+        })
+
+    def _save_worker(self) -> None:
+        """Drain the save queue, serializing checkpoints off the main thread."""
+        while True:
+            job = self._save_queue.get()
+            if job is None:
+                self._save_queue.task_done()
+                break
+            try:
+                self._write_checkpoint(job)
+            except Exception as e:  # never let one failure kill the worker
+                logger.error(f"[checkpoint] background save failed: {e}")
+            finally:
+                self._save_queue.task_done()
+
+    def _write_checkpoint(self, job: Dict[str, Any]) -> None:
+        step = job["step"]
+        is_snapshot = job["is_snapshot"]
+        state = job["state"]
+
+        if is_snapshot:
+            checkpoint_path = self.snapshots_dir / f"snapshot-{step:06d}.pt"
+        else:
+            checkpoint_path = self.recovery_dir / f"recovery-{step:06d}.pt"
+
+        # Atomically write to avoid partial writes (corruptions)
+        temp_path = checkpoint_path.with_suffix(".tmp")
+        torch.save(state, temp_path)
+        os.replace(temp_path, checkpoint_path)
+
+        # Update the 'latest' index. The full-file copy is now done in the
+        # background so it no longer stalls the training step.
+        latest_pt_path = self.latest_dir / "trainer_state.pt"
+        shutil.copy2(checkpoint_path, latest_pt_path)
+
+        # Write latest metadata index atomically
+        training_state = {
+            "latest_step": step,
+            "latest_epoch": state.get("epoch", step),
+            "latest_checkpoint_file": str(checkpoint_path.relative_to(self.output_dir)),
+            "metadata": state.get("metadata", {}),
+        }
+        latest_json_path = self.latest_dir / "training_state.json"
+        temp_json = latest_json_path.with_suffix(".tmp")
+        with open(temp_json, "w", encoding="utf-8") as f:
+            json.dump(training_state, f, indent=4)
+        os.replace(temp_json, latest_json_path)
+
+        # Enforce rolling history for recovery checkpoints
+        if not is_snapshot:
+            self._cleanup_old_recovery_checkpoints()
+
+    def shutdown(self, timeout: float = 600.0) -> None:
+        """
+        Flush all pending checkpoint writes and stop the background worker.
+        Safe to call multiple times.
+        """
+        if self._worker_thread is None:
+            return
+        try:
+            self._save_queue.join()
+        except Exception:
+            pass
+        self._save_queue.put(None)
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout)
+        self._worker_thread = None
+
     def _create_directories(self) -> None:
         """Create all sub-directories needed for organized checkpoints."""
         self.latest_dir.mkdir(parents=True, exist_ok=True)
@@ -85,53 +188,63 @@ class CheckpointManager:
         rng_states: Optional[Dict[str, Any]] = None
     ) -> None:
         """
-        Saves full trainer state (internal) and exported lora weights (ecosystem compatible).
-        Also manages rolling recovery checkpoint limits.
+        Collects a fully CPU-resident snapshot on the calling (training) thread,
+        then hands it to a background worker for serialization so the training
+        step is never blocked by disk I/O.
+
+        Both rolling recovery and long-term snapshots store the FULL trainer
+        state (LoRA weights + optimizer + scheduler + scaler + RNG). Rolling
+        checkpoints are saved frequently and rotated (keep_last), so auto-resume
+        recovers from the most recent point with exact optimizer momentum and LR
+        schedule. Snapshots are the infrequent, permanently-retained archive.
         """
         metadata = self.build_metadata(step, epoch)
 
-        # Prepare the state object for serialization
-        state = {
+        # LoRA weights are still on the GPU; detach + clone to CPU immediately
+        # so the background writer never touches GPU memory (avoids GPU OOM).
+        lora_state_dict = self._to_cpu(lora_manager.get_lora_state_dict())
+
+        state: Dict[str, Any] = {
             "metadata": metadata,
             "step": step,
             "epoch": epoch,
-            "lora_state_dict": lora_manager.get_lora_state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if hasattr(scheduler, "state_dict") else None,
-            "grad_scaler_state_dict": grad_scaler.state_dict() if grad_scaler is not None else None,
-            "rng_states": rng_states or self._get_current_rng_states()
+            "lora_state_dict": lora_state_dict,
+            "optimizer_state_dict": self._to_cpu(optimizer.state_dict()),
+            "rng_states": rng_states or self._get_current_rng_states(),
         }
+        if hasattr(scheduler, "state_dict"):
+            state["scheduler_state_dict"] = self._to_cpu(scheduler.state_dict())
+        if grad_scaler is not None:
+            state["grad_scaler_state_dict"] = self._to_cpu(grad_scaler.state_dict())
 
-        # Save to recovery or snapshot directory
+        job = {"step": step, "is_snapshot": is_snapshot, "state": state}
+
         if is_snapshot:
-            checkpoint_path = self.snapshots_dir / f"snapshot-{step:06d}.pt"
+            # Snapshots are the infrequent, permanently-retained archive. Serialize
+            # them on the background thread so a (rare) large snapshot write never
+            # stalls a training step.
+            self._enqueue_save(step, is_snapshot, state)
         else:
-            checkpoint_path = self.recovery_dir / f"recovery-{step:06d}.pt"
+            # Rolling recovery checkpoints are the resume safety net and MUST be
+            # durable the instant save_checkpoint returns: a crash right after
+            # return has to find the newest recovery on disk. Write synchronously
+            # on the caller thread.
+            self._write_checkpoint(job)
 
-        # Atomically write to avoid partial writes (corruptions)
-        temp_path = checkpoint_path.with_suffix(".tmp")
-        torch.save(state, temp_path)
-        os.replace(temp_path, checkpoint_path)
+    def flush(self, timeout: float = 600.0) -> None:
+        """
+        Block until every queued (snapshot) write has been serialized.
 
-        # Update the 'latest' trainer symlinks/files as a lightweight index pointer
-        latest_pt_path = self.latest_dir / "trainer_state.pt"
-        # We can copy or reference. For robustness, let's copy the file.
-        shutil.copy2(checkpoint_path, latest_pt_path)
-
-        # Write latest metadata index
-        training_state = {
-            "latest_step": step,
-            "latest_epoch": epoch,
-            "latest_checkpoint_file": str(checkpoint_path.relative_to(self.output_dir)),
-            "metadata": metadata
-        }
-        latest_json_path = self.latest_dir / "training_state.json"
-        with open(latest_json_path, "w", encoding="utf-8") as f:
-            json.dump(training_state, f, indent=4)
-
-        # Enforce rolling history for recovery checkpoints
-        if not is_snapshot:
-            self._cleanup_old_recovery_checkpoints()
+        Recovery checkpoints are written synchronously by save_checkpoint, so this
+        only affects the background snapshot writer. Safe to call when no writes are
+        pending. Used by tests and by shutdown() before process exit.
+        """
+        if self._worker_thread is None:
+            return
+        try:
+            self._save_queue.join()
+        except Exception:
+            pass
 
     def _get_current_rng_states(self) -> Dict[str, Any]:
         """Captures the standard random number generators states."""
@@ -215,11 +328,12 @@ class CheckpointManager:
         if "step" not in state or "epoch" not in state:
             return False, "Missing step or epoch info"
 
-        # 4. Check optimizer/scheduler states
+        # 4. Check core state. Optimizer/scheduler are optional because
+        #    rolling recovery checkpoints store only the minimal resume set.
         if "lora_state_dict" not in state:
             return False, "Missing lora_state_dict"
-        if "optimizer_state_dict" not in state:
-            return False, "Missing optimizer_state_dict"
+        if "optimizer_state_dict" in state and not isinstance(state["optimizer_state_dict"], dict):
+            return False, "optimizer_state_dict is not a dictionary"
 
         return True, None
 

@@ -156,6 +156,10 @@ def test_auto_resume_selection(tmp_path, test_config):
         is_snapshot=False
     )
 
+    # Recovery is written synchronously, but the snapshot is queued to the
+    # background worker; flush so the auto-resume scan sees a deterministic state.
+    manager.flush()
+
     # The newest valid checkpoint should be the recovery at step 10
     best_chk = manager.get_auto_resume_checkpoint()
     assert best_chk is not None

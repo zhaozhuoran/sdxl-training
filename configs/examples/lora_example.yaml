@@ -74,6 +74,10 @@ dataset:
   # Options/Optional values: false (default, faster), true (lower peak VRAM)
   cache_vae_slicing: false
 
+  # Precision for the VAE encode during precaching.
+  # Options/Optional values: "fp32" (default, safe), "bf16" (lower peak VRAM + faster via autocast; slight quality risk)
+  cache_vae_dtype: "fp32"
+
   # --- Aspect-ratio bucketing ---
   # Images are assigned to the bucket whose aspect ratio is closest to their own,
   # resized (preserving aspect ratio, scaling to cover) and center-cropped. This

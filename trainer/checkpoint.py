@@ -64,6 +64,13 @@ class CheckpointManager:
         )
         self._worker_thread.start()
 
+        # Guards the shared "latest" index (latest/trainer_state.pt and
+        # latest/training_state.json) which is updated by BOTH the synchronous
+        # recovery writes (caller thread) and the asynchronous snapshot writer
+        # (background thread). Without it the two could race on the same temp
+        # file / target and corrupt or fail the update.
+        self._latest_lock = threading.Lock()
+
     @staticmethod
     def _to_cpu(obj: Any) -> Any:
         """
@@ -117,22 +124,24 @@ class CheckpointManager:
         os.replace(temp_path, checkpoint_path)
 
         # Update the 'latest' index. The full-file copy is now done in the
-        # background so it no longer stalls the training step.
+        # background so it no longer stalls the training step. This section
+        # touches shared files, so serialize it across the caller and worker.
         latest_pt_path = self.latest_dir / "trainer_state.pt"
-        shutil.copy2(checkpoint_path, latest_pt_path)
+        with self._latest_lock:
+            shutil.copy2(checkpoint_path, latest_pt_path)
 
-        # Write latest metadata index atomically
-        training_state = {
-            "latest_step": step,
-            "latest_epoch": state.get("epoch", step),
-            "latest_checkpoint_file": str(checkpoint_path.relative_to(self.output_dir)),
-            "metadata": state.get("metadata", {}),
-        }
-        latest_json_path = self.latest_dir / "training_state.json"
-        temp_json = latest_json_path.with_suffix(".tmp")
-        with open(temp_json, "w", encoding="utf-8") as f:
-            json.dump(training_state, f, indent=4)
-        os.replace(temp_json, latest_json_path)
+            # Write latest metadata index atomically
+            training_state = {
+                "latest_step": step,
+                "latest_epoch": state.get("epoch", step),
+                "latest_checkpoint_file": str(checkpoint_path.relative_to(self.output_dir)),
+                "metadata": state.get("metadata", {}),
+            }
+            latest_json_path = self.latest_dir / "training_state.json"
+            temp_json = latest_json_path.with_suffix(".tmp")
+            with open(temp_json, "w", encoding="utf-8") as f:
+                json.dump(training_state, f, indent=4)
+            os.replace(temp_json, latest_json_path)
 
         # Enforce rolling history for recovery checkpoints
         if not is_snapshot:
@@ -328,12 +337,13 @@ class CheckpointManager:
         if "step" not in state or "epoch" not in state:
             return False, "Missing step or epoch info"
 
-        # 4. Check core state. Optimizer/scheduler are optional because
-        #    rolling recovery checkpoints store only the minimal resume set.
+        # 4. Check core state. Optimizer/scheduler state is stored in every
+        #    checkpoint (rolling recovery and snapshots alike), so a missing or
+        #    invalid optimizer state marks the checkpoint as corrupt/unusable.
         if "lora_state_dict" not in state:
             return False, "Missing lora_state_dict"
-        if "optimizer_state_dict" in state and not isinstance(state["optimizer_state_dict"], dict):
-            return False, "optimizer_state_dict is not a dictionary"
+        if "optimizer_state_dict" not in state or not isinstance(state["optimizer_state_dict"], dict):
+            return False, "Missing or invalid optimizer_state_dict"
 
         return True, None
 

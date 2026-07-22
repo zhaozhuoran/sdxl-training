@@ -70,6 +70,10 @@ outputs/
 *.swp
 *.swo
 
+# Environment-specific test configs (hardcode absolute host paths)
+configs/test_fast.yaml
+configs/test_single_file.yaml
+
 # OS files
 .DS_Store
 Thumbs.db

@@ -6,6 +6,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from safetensors.torch import load_file, save_file
 
 from trainer.bucketing import (
     make_buckets,
@@ -14,6 +15,53 @@ from trainer.bucketing import (
     BucketBatchSampler,
 )
 from trainer.caption import CaptionProcessor
+
+
+def _load_cache_file(path: Path) -> Dict[str, Any]:
+    """Load a dataset cache file, supporting both the new safetensors format and
+    legacy pickle (.pt) files for backwards compatibility.
+
+    Returns a dict with the canonical keys (latents / prompt_embeds /
+    pooled_prompt_embeds / original_size / crop_ltrb / bucket_size) so callers
+    behave identically regardless of the on-disk format. Corrupt or unreadable
+    files fall back to an empty dict (treated as a cache miss).
+    """
+    try:
+        st = load_file(str(path))
+        return {
+            "format": "sdxl-trainer-cache",
+            "version": 1,
+            "latents": st.get("latents"),
+            "prompt_embeds": st.get("prompt_embeds"),
+            "pooled_prompt_embeds": st.get("pooled_prompt_embeds"),
+            "original_size": tuple(int(v) for v in st["original_size"].tolist()),
+            "crop_ltrb": tuple(int(v) for v in st["crop_ltrb"].tolist()),
+            "bucket_size": tuple(int(v) for v in st["bucket_size"].tolist()),
+        }
+    except Exception:
+        try:
+            return torch.load(path, map_location="cpu")
+        except Exception:
+            return {}
+
+
+def _save_cache_file(payload: Dict[str, Any], path: Path) -> None:
+    """Persist a dataset cache payload using the safetensors format (faster and
+    safer than pickle). Tensor outputs are stored as-is; scalar SDXL
+    conditioning metadata is stored as int32 tensors, and format/version as the
+    safetensors header metadata.
+    """
+    st: Dict[str, torch.Tensor] = {}
+    if payload.get("latents") is not None:
+        st["latents"] = payload["latents"].contiguous()
+    if payload.get("prompt_embeds") is not None:
+        st["prompt_embeds"] = payload["prompt_embeds"].contiguous()
+    if payload.get("pooled_prompt_embeds") is not None:
+        st["pooled_prompt_embeds"] = payload["pooled_prompt_embeds"].contiguous()
+    st["original_size"] = torch.tensor(payload["original_size"], dtype=torch.int32)
+    st["crop_ltrb"] = torch.tensor(payload["crop_ltrb"], dtype=torch.int32)
+    st["bucket_size"] = torch.tensor(payload["bucket_size"], dtype=torch.int32)
+    save_file(st, str(path), metadata={"format": "sdxl-trainer-cache", "version": "1"})
 
 
 class ImageCaptionDataset(Dataset):
@@ -148,7 +196,7 @@ class ImageCaptionDataset(Dataset):
         elif self.cache_destination == "disk" and self.cache_dir_path is not None:
             disk_path = self.cache_dir_path / f"cache_{path_hash}.pt"
             if disk_path.exists():
-                cached = torch.load(disk_path, map_location="cpu")
+                cached = _load_cache_file(disk_path)
                 if self.cache_latents_enabled and cached.get("latents") is not None:
                     item["latents"] = cached["latents"]
                 if self.cache_te_enabled and cached.get("prompt_embeds") is not None:
@@ -216,6 +264,8 @@ def create_dataloader(
     bucket_min_size: Optional[int] = None,
     bucket_max_size: Optional[int] = None,
     caption_processor: Optional[CaptionProcessor] = None,
+    seed: Optional[int] = None,
+    pin_memory: bool = False,
 ) -> DataLoader:
     """Constructs a DataLoader that batches samples by aspect-ratio bucket."""
     dataset = ImageCaptionDataset(
@@ -226,11 +276,14 @@ def create_dataloader(
         bucket_max_size=bucket_max_size,
         caption_processor=caption_processor,
     )
-    batch_sampler = BucketBatchSampler(dataset.bucket_of_index, batch_size, shuffle=shuffle)
+    batch_sampler = BucketBatchSampler(
+        dataset.bucket_of_index, batch_size, shuffle=shuffle, seed=seed
+    )
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
         collate_fn=collate_fn,
+        pin_memory=pin_memory,
         # drop_last is handled implicitly: bucket groups may yield partial last batches
     )

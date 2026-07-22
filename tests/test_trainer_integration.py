@@ -1,5 +1,6 @@
 import os
 import pytest
+import torch
 from PIL import Image
 from trainer.engine.trainer import SDXLTrainer
 
@@ -15,6 +16,12 @@ training:
 """
     config_file = tmp_path / "config.yaml"
     config_file.write_text(config_yaml)
+
+    # This test verifies the GPU-first guard, which only fires when no CUDA GPU
+    # is present. On a CUDA-enabled machine the guard is intentionally never
+    # triggered, so skip rather than fail.
+    if torch.cuda.is_available():
+        pytest.skip("Requires a CUDA-less environment to verify the GPU-first guard.")
 
     # In regular production execution, if no GPU is available, it must raise RuntimeError immediately.
     with pytest.raises(RuntimeError) as exc_info:

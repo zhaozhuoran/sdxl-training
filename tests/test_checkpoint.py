@@ -76,6 +76,9 @@ def test_checkpoint_saving_and_rolling_cleanup(tmp_path, test_config):
     assert (manager.recovery_dir / "recovery-000002.pt").exists()
     assert (manager.recovery_dir / "recovery-000003.pt").exists()
 
+    # Stop the background snapshot writer so it doesn't outlive tmp_path cleanup.
+    manager.shutdown()
+
 
 def test_checkpoint_validation_and_fallback(tmp_path, test_config):
     manager = CheckpointManager(test_config, output_dir=str(tmp_path))
@@ -172,3 +175,6 @@ def test_auto_resume_selection(tmp_path, test_config):
     best_chk_after_corruption = manager.get_auto_resume_checkpoint()
     assert best_chk_after_corruption is not None
     assert "snapshot-000005.pt" in best_chk_after_corruption.name
+
+    # Stop the background snapshot writer so it doesn't outlive tmp_path cleanup.
+    manager.shutdown()

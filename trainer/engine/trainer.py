@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 
 from trainer.config import TrainingPipelineConfig, load_config
 from trainer.logging import get_logger, setup_file_logger
-from trainer.dataset import create_dataloader
+from trainer.dataset import create_dataloader, _load_cache_file, _save_cache_file
 from trainer.checkpoint import CheckpointManager
 from trainer.methods.lora.injection import LoRAInjectionManager
 from trainer.methods.lora.exporter import export_kohya_safetensors
@@ -378,6 +378,8 @@ class SDXLTrainer:
             bucket_min_size=self.config.dataset.bucket_min_size,
             bucket_max_size=self.config.dataset.bucket_max_size,
             caption_processor=self.caption_processor,
+            seed=self.config.training.seed,
+            pin_memory=(self.device.type == "cuda"),
         )
 
     def setup_precision(self) -> None:
@@ -386,9 +388,20 @@ class SDXLTrainer:
         if mp == "fp16":
             self.grad_scaler = torch.amp.GradScaler("cuda")
             logger.info("Mixed precision FP16 scaling configured.")
+        elif mp == "no":
+            self.grad_scaler = None
+            logger.info("Mixed precision disabled (fp32); no scaler configured.")
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                if total_gb < 16:
+                    logger.warning(
+                        "mixed_precision='no' keeps the UNet in fp32 (~5.8GB) and disables "
+                        "GradScaler; on GPUs with <16GB VRAM this risks OOM and is slower. "
+                        "Recommend 'bf16'."
+                    )
         else:
             self.grad_scaler = None
-            logger.info("Mixed precision default / bf16 scaling (no scaler required) configured.")
+            logger.info("Mixed precision bf16 scaling (no scaler required) configured.")
 
     def handle_resume(self) -> None:
         """
@@ -431,28 +444,34 @@ class SDXLTrainer:
             # Load lora weights (always present)
             self.lora_manager.load_lora_state_dict(state["lora_state_dict"])
 
-            # Optimizer/scheduler/scaler are only stored in full snapshots.
-            # Rolling recovery checkpoints omit them, so resuming from one
-            # rebuilds optimizer momentum & LR schedule from scratch.
+            # Optimizer/scheduler/scaler are stored in EVERY checkpoint (both
+            # rolling recovery and snapshots), so resume restores exact optimizer
+            # momentum and LR schedule. The guard below only exists for loading
+            # legacy checkpoints that predate this convention.
             if "optimizer_state_dict" in state:
                 self.optimizer.load_state_dict(state["optimizer_state_dict"])
             else:
                 logger.warning(
-                    "Checkpoint has no optimizer state (rolling recovery). "
-                    "Resuming with a freshly initialized optimizer; momentum/LR "
-                    "schedule restart from the configured values."
+                    "Checkpoint has no optimizer state; resuming with a freshly "
+                    "initialized optimizer (momentum/LR schedule restart)."
                 )
             if self.scheduler and state.get("scheduler_state_dict"):
                 self.scheduler.load_state_dict(state["scheduler_state_dict"])
             if self.grad_scaler and state.get("grad_scaler_state_dict"):
                 self.grad_scaler.load_state_dict(state["grad_scaler_state_dict"])
 
-            # Restore random states
+            # Restore random states. The checkpoint may have been loaded with
+            # map_location="cuda", which relocates the CPU RNG-state ByteTensor(s)
+            # onto the GPU; torch.set_rng_state requires a CPU ByteTensor, so move
+            # them back to CPU first.
             rngs = state.get("rng_states", {})
             if rngs.get("torch_cpu") is not None:
-                torch.set_rng_state(rngs["torch_cpu"])
+                torch.set_rng_state(rngs["torch_cpu"].cpu())
             if rngs.get("torch_cuda") is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state_all(rngs["torch_cuda"])
+                cuda_states = rngs["torch_cuda"]
+                if isinstance(cuda_states, (list, tuple)):
+                    cuda_states = [s.cpu() for s in cuda_states]
+                torch.cuda.set_rng_state_all(cuda_states)
             if rngs.get("caption") is not None and getattr(self, "caption_processor", None) is not None:
                 self.caption_processor.set_rng_state(rngs["caption"])
 
@@ -527,6 +546,9 @@ class SDXLTrainer:
         self._latents_cached = cache_latents
         self._te_cached = cache_te
 
+        # Precision for the VAE encode during precaching (fp32 safe, bf16 faster/lower VRAM).
+        cache_vae_dtype = self.config.dataset.cache_vae_dtype
+
         if not cache_latents and not cache_te:
             return
 
@@ -590,7 +612,7 @@ class SDXLTrainer:
             cached = None
             if disk_path.exists():
                 try:
-                    cached = torch.load(disk_path, map_location="cpu")
+                    cached = _load_cache_file(disk_path)
                 except Exception:
                     cached = {}
                 if cache_latents and cached.get("latents") is not None:
@@ -638,7 +660,7 @@ class SDXLTrainer:
 
             if disk_path.exists():
                 try:
-                    cached = torch.load(disk_path, map_location="cpu")
+                    cached = _load_cache_file(disk_path)
                 except Exception:
                     cached = {}
                 if cache_latents and cached.get("latents") is not None:
@@ -737,7 +759,14 @@ class SDXLTrainer:
                 groups[b["bucket"]].append(b)
             for _bucket, grp in groups.items():
                 pv = torch.stack([x["pixel_values"] for x in grp]).to(device, dtype=self.vae.dtype)
-                latents_dist = self.vae.encode(pv).latent_dist
+                # Encode in bf16 (autocast) when requested to cut peak VRAM + time.
+                # VAE weights stay fp32; the result is cast to the training weight_dtype
+                # for storage, so stored quality is unaffected (only the encode path differs).
+                if cache_vae_dtype == "bf16" and torch.cuda.is_available():
+                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        latents_dist = self.vae.encode(pv).latent_dist
+                else:
+                    latents_dist = self.vae.encode(pv).latent_dist
                 out = latents_dist.sample() if hasattr(latents_dist, "sample") else latents_dist.mode()
                 out = (out * self.vae.config.scaling_factor).to(weight_dtype).cpu()
                 for x, lat in zip(grp, out):
@@ -770,7 +799,7 @@ class SDXLTrainer:
                         "crop_ltrb": b["crop_ltrb"],
                         "bucket_size": b["bucket"],
                     }
-                    torch.save(payload, b["disk_path"])
+                    _save_cache_file(payload, b["disk_path"])
 
                 # Additionally keep an in-RAM copy when destination is ram.
                 if cache_destination == "ram":
@@ -826,6 +855,13 @@ class SDXLTrainer:
         if getattr(self, "_te_cached", False):
             self.text_encoder_1.to("cpu")
             self.text_encoder_2.to("cpu")
+
+        # Reclaim the now-free GPU memory immediately so the CUDA caching
+        # allocator returns the blocks to the driver instead of holding them
+        # reserved (the offloaded models are no longer used in the loop).
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
 
     def _encode_prompt(self, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -885,7 +921,10 @@ class SDXLTrainer:
         rows = []
         for (ow, oh), (t, l), (tw, th) in zip(original_sizes, crop_originals, target_sizes):
             rows.append([oh, ow, t, l, th, tw])
-        return torch.tensor(rows, device=self.device, dtype=self.weight_dtype)
+        # SDXL micro-conditioning time_ids are conditioning metadata, not model
+        # weights; keep them float32 regardless of the training precision so the
+        # UNet's added-cond projection is not fed low-precision (bf16/fp16) inputs.
+        return torch.tensor(rows, device=self.device, dtype=torch.float32)
 
     def train_step(self, batch: Dict[str, Any]) -> float:
         """
@@ -911,22 +950,22 @@ class SDXLTrainer:
             if self.is_test_mode:
                 if "latents" in batch:
                     # In test mode with caching
-                    latents = batch["latents"].to(self.device, dtype=dtype)
+                    latents = batch["latents"].to(self.device, dtype=dtype, non_blocking=True)
                     # For mock UNet in test mode, UNet forward expects [b, c, h, w] matching latents
                     output = self.unet(latents)
                 else:
-                    pixel_values = batch["pixel_values"].to(self.device, dtype=dtype)
+                    pixel_values = batch["pixel_values"].to(self.device, dtype=dtype, non_blocking=True)
                     output = self.unet(pixel_values)
                 loss = torch.mean((output - 0.0) ** 2)
             else:
                 # Real SDXL forward pass
                 # 1. Get or encode images to latents
                 if "latents" in batch:
-                    latents = batch["latents"].to(self.device, dtype=dtype)
+                    latents = batch["latents"].to(self.device, dtype=dtype, non_blocking=True)
                 else:
                     if self.vae.device != self.device:
                         self.vae.to(self.device)
-                    pixel_values = batch["pixel_values"].to(self.device, dtype=self.vae.dtype)
+                    pixel_values = batch["pixel_values"].to(self.device, dtype=self.vae.dtype, non_blocking=True)
                     # Pass through standard VAE to extract latents
                     latents = self.vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
@@ -946,8 +985,8 @@ class SDXLTrainer:
 
                 # 3. Get or encode prompt captions
                 if "prompt_embeds" in batch:
-                    prompt_embeds = batch["prompt_embeds"].to(self.device, dtype=dtype)
-                    pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, dtype=dtype)
+                    prompt_embeds = batch["prompt_embeds"].to(self.device, dtype=dtype, non_blocking=True)
+                    pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, dtype=dtype, non_blocking=True)
                 else:
                     # Text Encoder outputs are not cached (e.g. caption dropout enabled):
                     # process captions fresh, applying whole-caption dropout per step.
@@ -1004,25 +1043,65 @@ class SDXLTrainer:
 
         return loss.item()
 
+    def _log_vram(self, tag: str) -> None:
+        """Logs current + peak CUDA memory at a phase boundary (no-op on CPU)."""
+        if not torch.cuda.is_available():
+            return
+        alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 2)
+        peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        logger.info(
+            f"[VRAM][{tag}] allocated={alloc:.0f}MB reserved={reserved:.0f}MB peak={peak:.0f}MB"
+        )
+
     def run(self) -> None:
         """Main training cycle coordinating epochs, checkpoints, and telemetry logging."""
         logger.info("Initializing SDXL LoRA training pipeline...")
+
+        # Enable TF32 matmul + cuDNN benchmark for free throughput on Ampere+ GPUs.
+        # These are global, process-wide settings; only meaningful on CUDA.
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            logger.info("Enabled TF32 matmul + cuDNN benchmark for CUDA.")
 
         # Setup all dependencies.
         # Models needed for caching (VAE + Text Encoders) are loaded first; the UNet
         # is deferred until after caching to keep VRAM free during the precache phase.
         self.setup_models()
+        self._log_vram("after_setup_models")
         self.setup_dataloader()
 
         # Cache dataset (latents & text encoder outputs) if enabled
         self.cache_dataset()
+        self._log_vram("after_cache_dataset")
 
         # Load the UNet only now, after caching is done.
         self.setup_unet()
         self.setup_lora()
+
+        # Optionally compile the UNet for faster training. Must happen AFTER LoRA
+        # injection so the compiled graph includes the LoRA wrapper layers.
+        # dynamic=True because bucket sizes vary across batches (no recompile per
+        # bucket). Skipped in test mode (mock models, compilation is meaningless
+        # and requires a host C compiler). Real compilation failures surface at
+        # the first forward and fall back to eager via the guard below.
+        if (
+            self.config.training.compile_unet
+            and not self.is_test_mode
+            and self.device.type == "cuda"
+        ):
+            try:
+                self.unet = torch.compile(self.unet, dynamic=True)
+                logger.info("torch.compile enabled on UNet (dynamic shapes).")
+            except Exception as e:
+                logger.warning("torch.compile failed (%s); using eager UNet.", e)
+
         self.setup_optimizer()
         self.setup_scheduler()
         self.setup_precision()
+        self._log_vram("after_setup_unet_lora")
 
         # Resume state if required
         self.handle_resume()
@@ -1048,6 +1127,12 @@ class SDXLTrainer:
             desc="Training steps",
             dynamic_ncols=True
         )
+
+        # Reset peak stats so the loop-phase telemetry reflects training only
+        # (not the model-load / precache spikes measured above).
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+        self._log_vram("before_training_loop")
 
         try:
             with logging_redirect_tqdm(loggers=[logger]):
@@ -1080,9 +1165,10 @@ class SDXLTrainer:
                         # Structured step logging (throttled: one line per 1k steps;
                         # the tqdm bar still updates every step for live progress)
                         if self.global_step % 1000 == 0:
+                            peak = (torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
                             logger.info(
                                 f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
-                                f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s"
+                                f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s | VRAM_peak: {peak:.0f}MB"
                             )
 
                         # Update tqdm progress bar with postfix metadata
@@ -1149,6 +1235,8 @@ class SDXLTrainer:
             progress_bar.close()
             # Flush any pending background checkpoint writes before exiting.
             self.checkpoint_manager.shutdown()
+
+        self._log_vram("after_training")
 
         # Post training: Export final LoRA safetensors to lora directory
         logger.info("Training completed successfully. Exporting final compatible LoRA safetensors...")

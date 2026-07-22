@@ -17,8 +17,9 @@ Key ideas
   (``add_time_ids``) needs the real original size and crop, not a fake constant.
 """
 
+import random
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.utils.data import Sampler
@@ -146,10 +147,21 @@ class BucketBatchSampler(Sampler):
     latents) has identical spatial dimensions and can be ``torch.stack``-ed.
     """
 
-    def __init__(self, bucket_of_index: List[Tuple[int, int]], batch_size: int, shuffle: bool = True):
+    def __init__(
+        self,
+        bucket_of_index: List[Tuple[int, int]],
+        batch_size: int,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+    ):
         self.bucket_of_index = bucket_of_index
         self.batch_size = max(1, batch_size)
         self.shuffle = shuffle
+        # Dedicated RNG so dataset ordering is reproducible given a seed.
+        # A single instance is reused across epochs: the within-bucket order is
+        # fixed at construction, while the batch order is reshuffled in __iter__,
+        # giving varied-but-deterministic ordering per epoch.
+        self._rng = random.Random(seed)
 
         # Group sample indices by bucket key
         self.bucket_groups = {}
@@ -159,15 +171,13 @@ class BucketBatchSampler(Sampler):
         self.batches = []
         for b, indices in self.bucket_groups.items():
             if self.shuffle:
-                import random
-                random.shuffle(indices)
+                self._rng.shuffle(indices)
             for i in range(0, len(indices), self.batch_size):
                 self.batches.append(indices[i : i + self.batch_size])
 
     def __iter__(self):
         if self.shuffle:
-            import random
-            random.shuffle(self.batches)
+            self._rng.shuffle(self.batches)
         for batch in self.batches:
             yield batch
 

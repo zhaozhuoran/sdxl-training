@@ -25,6 +25,8 @@ class DatasetConfig(BaseModel):
     cache_batch_size: int = Field(2, description="Number of samples encoded together on the GPU during precaching. Higher is faster (better GPU utilization) but uses more peak VRAM; freed each batch via torch.cuda.empty_cache().")
     cache_vae_slicing: bool = Field(False, description="Slice the VAE encode to cap peak VRAM during precaching. Default off (speed-first); enable on VRAM-constrained GPUs. Peak VRAM is still reclaimed each batch via torch.cuda.empty_cache() regardless.")
 
+    cache_vae_dtype: str = Field("fp32", description="Precision used for VAE encoding during precaching: 'fp32' (safe, default) or 'bf16' (lower peak VRAM and faster, via autocast; slight quality risk). Stored latents are always cast to the training weight_dtype.")
+
     # Aspect-ratio bucketing
     bucket_step: int = Field(64, description="Bucket size step in pixels. Both bucket dimensions are multiples of this (must be 8-safe for the VAE).")
     bucket_min_size: Optional[int] = Field(None, description="Minimum bucket dimension. Defaults to bucket_step if null.")
@@ -43,6 +45,13 @@ class DatasetConfig(BaseModel):
             raise ValueError("cache_destination must be either 'ram' or 'disk'")
         return v
 
+    @field_validator("cache_vae_dtype")
+    @classmethod
+    def validate_cache_vae_dtype(cls, v: str) -> str:
+        if v not in {"fp32", "bf16"}:
+            raise ValueError("cache_vae_dtype must be either 'fp32' or 'bf16'")
+        return v
+
 
 class TrainingConfig(BaseModel):
     steps: int = Field(..., description="Total number of training steps.")
@@ -51,6 +60,7 @@ class TrainingConfig(BaseModel):
     gradient_checkpointing: bool = Field(True, description="Enable gradient checkpointing.")
     mixed_precision: str = Field("bf16", description="Mixed precision compute type. Must be 'fp16', 'bf16', or 'no'.")
     train_text_encoder: bool = Field(False, description="Whether to train the Text Encoders. If False, only train UNet.")
+    compile_unet: bool = Field(True, description="Compile the UNet with torch.compile (dynamic shapes) for faster training. Falls back to eager on failure.")
 
     @field_validator("mixed_precision")
     @classmethod

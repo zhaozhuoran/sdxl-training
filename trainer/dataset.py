@@ -1,4 +1,6 @@
 import os
+import json
+import struct
 import hashlib
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -6,7 +8,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
 
 from trainer.bucketing import (
     make_buckets,
@@ -15,6 +17,44 @@ from trainer.bucketing import (
     BucketBatchSampler,
 )
 from trainer.caption import CaptionProcessor
+
+
+def _read_safetensors_bytes(path: Path) -> Dict[str, torch.Tensor]:
+    """Load a safetensors file into torch tensors WITHOUT memory-mapping.
+
+    ``safetensors.load_file`` / ``safe_open`` memory-map the file by default.
+    mmap hangs or raises on several filesystems (network / 9P / exFAT mounts,
+    some USB drives), which silently broke dataset caching on those setups.
+    Reading the bytes once and parsing the header + raw tensor buffers in RAM
+    sidesteps mmap entirely and works everywhere. BF16 is stored as raw uint16
+    and is reinterpreted via ``torch.frombuffer`` (no copy).
+    """
+    _SAFE_DTYPES = {
+        "F64": torch.float64,
+        "F32": torch.float32,
+        "F16": torch.float16,
+        "BF16": torch.bfloat16,
+        "I64": torch.int64,
+        "I32": torch.int32,
+        "I16": torch.int16,
+        "I8": torch.int8,
+        "U8": torch.uint8,
+        "BOOL": torch.bool,
+    }
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+        data = f.read()
+    out: Dict[str, torch.Tensor] = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        dtype = _SAFE_DTYPES[meta["dtype"]]
+        shape = tuple(meta["shape"])
+        start, end = meta["data_offsets"]
+        buf = bytearray(data[start:end])
+        out[name] = torch.frombuffer(buf, dtype=dtype).reshape(shape)
+    return out
 
 
 def _load_cache_file(path: Path) -> Dict[str, Any]:
@@ -27,7 +67,7 @@ def _load_cache_file(path: Path) -> Dict[str, Any]:
     files fall back to an empty dict (treated as a cache miss).
     """
     try:
-        st = load_file(str(path))
+        st = _read_safetensors_bytes(path)
         return {
             "format": "sdxl-trainer-cache",
             "version": 1,

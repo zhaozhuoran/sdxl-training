@@ -9,6 +9,10 @@
 # 1. Model Configuration
 # ------------------------------------------------------------------------------
 model:
+  # The name of the model, used as model metadata (e.g., ss_output_name).
+  # Options/Optional values: "my_sdxl_lora", null
+  model_name: null
+
   # Path to pretrained SDXL base model (can be a local directory or HF model hub ID)
   # Examples: "stabilityai/stable-diffusion-xl-base-1.0", "path/to/local/sdxl_base"
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
@@ -128,7 +132,10 @@ training:
 
   # Enable gradient checkpointing to dramatically save VRAM at a slight speed cost.
   # Options/Optional values: true, false
-  gradient_checkpointing: true
+  # For UNet-only LoRA at batch_size=1 (e.g. on an RTX 3060) there is usually VRAM
+  # headroom, so leaving this off recovers ~20-30% training speed. Enable (true) if
+  # you hit OOM or raise the batch size / train text encoders.
+  gradient_checkpointing: false
 
   # Mixed precision mode. Highly recommended to use "bf16" (bfloat16) or "fp16" (float16).
   # Options/Optional values: "bf16" (strongly recommended for modern GPUs), "fp16", "no"
@@ -137,6 +144,10 @@ training:
   # Whether to train the Text Encoders. If false, we disable Text Encoder LoRA injection and only train UNet.
   # Default: false (UNet only)
   train_text_encoder: false
+
+  # If set, log per-step GPU time, throughput (it/s), peak VRAM and GPU util every N
+  # steps. Options/Optional values: null (disabled), or any positive integer (e.g., 10, 50)
+  log_every_steps: null
 
 # ------------------------------------------------------------------------------
 # 4. Network Parameter Configuration (LoRA)

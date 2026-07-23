@@ -64,6 +64,12 @@ Key fields to change:
 | `dataset.path`                        | Path to your image-caption dataset folder                            |
 | `dataset.resolution`                  | `1024` (standard SDXL)                                               |
 | `dataset.batch_size`                  | `1` on 12 GB VRAM; raise only if you have headroom                   |
+| `dataset.cache_latents`               | `true` (default) to cache VAE latents; `false` to disable            |
+| `dataset.cache_text_encoder_outputs`  | `true` (default) to cache TE outputs when `train_text_encoder` is false|
+| `dataset.cache_destination`           | `"ram"` (default, stores in memory) or `"disk"` (saves cache files)  |
+| `dataset.cache_workers`               | Number of parallel threads to load images/caches (default: `8`)      |
+| `dataset.cache_vae_slicing`           | `true` to slice VAE encoding to save peak VRAM during precaching     |
+| `dataset.cache_vae_dtype`             | `"fp32"` (safe default) or `"bf16"` (faster, lower peak VRAM)        |
 | `training.mixed_precision`            | `bf16` (recommended) or `fp16`                                       |
 | `training.train_text_encoder`         | `false` (UNet-only) to save VRAM; `true` only if you have spare VRAM |
 | `training.gradient_checkpointing`     | `true` if you hit OOM or raise batch size / train text encoders      |

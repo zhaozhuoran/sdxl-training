@@ -79,7 +79,8 @@ def export_kohya_safetensors(
     lora_state_dict: Dict[str, torch.Tensor],
     alpha: float,
     output_filepath: str,
-    metadata: Optional[Dict[str, str]] = None
+    metadata: Optional[Dict[str, str]] = None,
+    model_name: Optional[str] = None
 ) -> None:
     """
     Exports standard, ecosystem-compatible Kohya .safetensors LoRA checkpoint to disk.
@@ -101,12 +102,15 @@ def export_kohya_safetensors(
             rank = v.shape[0]
             break
     kohya_metadata = {
-        "ss_base_model_version": "sdxl",
+        "ss_base_model_version": "sdxl_base_v1-0",
         "ss_network_module": "networks.lora",
         "ss_network_type": "lora",
         "ss_network_dim": str(rank),
         "ss_network_alpha": str(alpha),
     }
+    if model_name:
+        kohya_metadata["ss_output_name"] = model_name
+
     if metadata:
         kohya_metadata.update(metadata)
 

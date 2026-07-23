@@ -41,6 +41,16 @@ class CaptionProcessor:
         # stays consistent and the captured checkpoint state reproduces exactly.
         self._lock = threading.Lock()
 
+    def __getstate__(self):
+        # Drop the non-picklable threading.Lock; it is recreated on unpickle.
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
     def seed(self, seed: Optional[int]) -> None:
         self._rng.seed(seed)
 

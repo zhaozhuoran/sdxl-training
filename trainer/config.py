@@ -5,6 +5,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ModelConfig(BaseModel):
+    model_name: Optional[str] = Field(
+        None, description="The name of the model, used as model metadata (e.g., ss_output_name)."
+    )
     pretrained_model_name_or_path: str = Field(
         ..., description="Path to pretrained model or model identifier from huggingface.co/models."
     )
@@ -57,16 +60,26 @@ class TrainingConfig(BaseModel):
     steps: int = Field(..., description="Total number of training steps.")
     seed: Optional[int] = Field(None, description="Random seed for reproducibility.")
     gradient_accumulation_steps: int = Field(1, description="Number of updates steps to accumulate before performing a backward/update pass.")
-    gradient_checkpointing: bool = Field(True, description="Enable gradient checkpointing.")
+    gradient_checkpointing: bool = Field(False, description="Enable gradient checkpointing. Trades ~20-30% speed for lower VRAM; with UNet-only LoRA at bs=1 there is usually headroom to leave it off.")
     mixed_precision: str = Field("bf16", description="Mixed precision compute type. Must be 'fp16', 'bf16', or 'no'.")
     train_text_encoder: bool = Field(False, description="Whether to train the Text Encoders. If False, only train UNet.")
-    compile_unet: bool = Field(True, description="Compile the UNet with torch.compile (dynamic shapes) for faster training. Falls back to eager on failure.")
+    compile_unet: bool = Field(False, description="Compile the UNet with torch.compile (dynamic shapes) for faster training. Off by default: the first compiled forward can deadlock/hang on some CUDA driver/xformers combinations, which presents as a hard stall at step 0. Enable only if your environment is known to support it.")
+    log_every_steps: Optional[int] = Field(None, description="If set, log per-step GPU time, throughput (it/s), peak VRAM and GPU util every N steps. Default off (null).")
+    min_free_vram_gb: float = Field(0.5, description="Minimum free VRAM in GB to keep. If free VRAM drops below this, an automated OOM is triggered.")
 
     @field_validator("mixed_precision")
     @classmethod
     def validate_mixed_precision(cls, v: str) -> str:
         if v not in {"fp16", "bf16", "no"}:
             raise ValueError("mixed_precision must be 'fp16', 'bf16', or 'no'")
+        return v
+
+    @field_validator("min_free_vram_gb")
+    @classmethod
+    def validate_min_free_vram_gb(cls, v: float) -> float:
+        import math
+        if v < 0.0 or not math.isfinite(v):
+            raise ValueError("min_free_vram_gb must be a non-negative finite float")
         return v
 
 

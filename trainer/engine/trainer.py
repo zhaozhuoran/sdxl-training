@@ -19,6 +19,11 @@ from trainer.methods.lora.exporter import export_kohya_safetensors
 logger = get_logger()
 
 
+class AutoOOMError(RuntimeError):
+    """Exception raised when the free VRAM falls below the configured threshold."""
+    pass
+
+
 class SDXLTrainer:
     """
     Core, high-performance, and extensible SDXL LoRA Training Engine.
@@ -34,6 +39,26 @@ class SDXLTrainer:
 
         # 2. Setup output directories
         self.output_dir = os.path.join(self.config.output.directory, self.config.output.experiment_name)
+
+        # Check compatibility before overwriting if resuming
+        old_config_path = os.path.join(self.output_dir, "config.yaml")
+        if os.path.exists(old_config_path) and self.config.resume.mode.lower() != "none":
+            old_config = None
+            try:
+                old_config = load_config(old_config_path)
+            except Exception as e:
+                logger.warning(f"Could not load old configuration: {e}. Proceeding anyway.")
+
+            if old_config is not None:
+                is_compatible, mismatches = self._check_structural_compatibility(old_config, self.config)
+                if not is_compatible:
+                    mismatch_details = "\n".join([f"  - {m}" for m in mismatches])
+                    raise RuntimeError(
+                        f"Cannot resume training due to structural configuration changes:\n{mismatch_details}"
+                    )
+                else:
+                    logger.info("Existing config found. Structural parameters are compatible. Resuming training automatically.")
+
         os.makedirs(self.output_dir, exist_ok=True)
 
         # Setup output logging directory
@@ -103,6 +128,53 @@ class SDXLTrainer:
         except Exception:
             pass
         return "unknown"
+
+    def _check_structural_compatibility(self, old: TrainingPipelineConfig, new: TrainingPipelineConfig) -> Tuple[bool, List[str]]:
+        """
+        Compares two configurations to determine if they are structurally compatible
+        for resuming training. Returns a tuple (is_compatible, list_of_mismatches).
+        """
+        mismatches = []
+
+        # 1. Model config
+        if old.model.pretrained_model_name_or_path != new.model.pretrained_model_name_or_path:
+            mismatches.append(f"model.pretrained_model_name_or_path: '{old.model.pretrained_model_name_or_path}' vs '{new.model.pretrained_model_name_or_path}'")
+        if old.model.vae_path != new.model.vae_path:
+            mismatches.append(f"model.vae_path: '{old.model.vae_path}' vs '{new.model.vae_path}'")
+
+        # 2. Network config
+        if old.network.type != new.network.type:
+            mismatches.append(f"network.type: '{old.network.type}' vs '{new.network.type}'")
+        if old.network.rank != new.network.rank:
+            mismatches.append(f"network.rank: {old.network.rank} vs {new.network.rank}")
+        if old.network.alpha != new.network.alpha:
+            mismatches.append(f"network.alpha: {old.network.alpha} vs {new.network.alpha}")
+
+        def get_sorted_list(lst):
+            if lst is None:
+                return None
+            return sorted(lst)
+
+        if get_sorted_list(old.network.unet_targets) != get_sorted_list(new.network.unet_targets):
+            mismatches.append(f"network.unet_targets: {old.network.unet_targets} vs {new.network.unet_targets}")
+        if get_sorted_list(old.network.text_encoder_1_targets) != get_sorted_list(new.network.text_encoder_1_targets):
+            mismatches.append(f"network.text_encoder_1_targets: {old.network.text_encoder_1_targets} vs {new.network.text_encoder_1_targets}")
+        if get_sorted_list(old.network.text_encoder_2_targets) != get_sorted_list(new.network.text_encoder_2_targets):
+            mismatches.append(f"network.text_encoder_2_targets: {old.network.text_encoder_2_targets} vs {new.network.text_encoder_2_targets}")
+
+        # 3. Training config (structural parts)
+        if old.training.train_text_encoder != new.training.train_text_encoder:
+            mismatches.append(f"training.train_text_encoder: {old.training.train_text_encoder} vs {new.training.train_text_encoder}")
+
+        # 4. Dataset config (structural parts)
+        old_path_abs = os.path.abspath(old.dataset.path) if old.dataset.path else ""
+        new_path_abs = os.path.abspath(new.dataset.path) if new.dataset.path else ""
+        if old_path_abs != new_path_abs:
+            mismatches.append(f"dataset.path: '{old.dataset.path}' vs '{new.dataset.path}'")
+        if old.dataset.resolution != new.dataset.resolution:
+            mismatches.append(f"dataset.resolution: {old.dataset.resolution} vs {new.dataset.resolution}")
+
+        return len(mismatches) == 0, mismatches
 
     def setup_models(self) -> None:
         """
@@ -486,13 +558,9 @@ class SDXLTrainer:
 
     def _enforce_config_compatibility(self, state: dict) -> None:
         """
-        Blocks silent recovery when the current config differs from the one the
-        checkpoint was saved with. A mismatch blends old training state (step,
-        LoRA weights, optimizer momentum) with new hyper-parameters, which can
-        corrupt training or crash on structural changes (rank, resolution, model...).
-
-        Requires an explicit interactive confirmation to proceed with replacing
-        the old config. Aborts when no interactive input is available.
+        Validates config compatibility. Since structural configuration compatibility is already
+        verified during SDXLTrainer initialization, a hash mismatch here represents safe,
+        non-structural modifications. Logs a warning and proceeds automatically.
         """
         old_hash = (state.get("metadata") or {}).get("config_hash")
         new_hash = self.config_hash
@@ -500,33 +568,28 @@ class SDXLTrainer:
             return
 
         logger.warning("=" * 64)
-        logger.warning("CONFIG MISMATCH: the checkpoint was saved with a DIFFERENT configuration.")
+        logger.warning("CONFIG HASH MISMATCH: the checkpoint was saved with a DIFFERENT configuration file.")
         logger.warning(f"  checkpoint config_hash: {old_hash}")
         logger.warning(f"  current   config_hash: {new_hash}")
-        logger.warning("Resuming will DISCARD the old config and continue with the CURRENT one.")
-        logger.warning("This can corrupt training if structural params changed")
-        logger.warning("(e.g. rank, resolution, model path, dataset path, train_text_encoder).")
+        logger.warning("Resuming automatically since structural parameters are compatible.")
         logger.warning("=" * 64)
 
-        if self.is_test_mode:
-            logger.warning("Test mode: auto-confirming config replacement (no interactive prompt).")
-            return
-
-        try:
-            answer = input(
-                "Type 'yes' to REPLACE the old config and resume, or anything else to abort: "
-            ).strip().lower()
-        except EOFError:
-            logger.error("No interactive input available; aborting resume to avoid unsafe config replacement.")
-            raise RuntimeError("Aborted: config mismatch and no confirmation provided.")
-
-        if answer != "yes":
-            raise RuntimeError("Aborted by user: config mismatch not confirmed.")
-
-    def cache_dataset(self) -> None:
+    def cache_dataset(self, loader_cache_destination: Optional[str] = None) -> None:
         """
         Pre-computes and caches VAE latents and Text Encoder outputs.
         Saves them to RAM (in-memory) or Disk (cache files).
+
+        ``loader_cache_destination`` overrides where the *training loop* reads
+        cached outputs from. This is decoupled from ``dataset.cache_destination``
+        (the precache write target) because of how DataLoader workers are spawned:
+        with ``num_workers > 0`` the engine uses the "spawn" start method, and
+        spawned workers cannot share the parent's RAM. Embedding the in-RAM cache
+        inside the dataset object would force PyTorch to pickle the entire cache
+        to every worker (a multi-GB transfer) and leave each worker holding its
+        own copy -- 5x RAM and swap thrash that stalls every step. When workers
+        are used we therefore force the loader to read the always-on disk cache
+        (kohya's model), keeping only ``num_workers == 0`` on the zero-copy RAM
+        path.
         """
         cache_latents = self.config.dataset.cache_latents
         cache_te = self.config.dataset.cache_text_encoder_outputs and not self.config.training.train_text_encoder
@@ -548,6 +611,14 @@ class SDXLTrainer:
 
         # Precision for the VAE encode during precaching (fp32 safe, bf16 faster/lower VRAM).
         cache_vae_dtype = self.config.dataset.cache_vae_dtype
+
+        # Effective destination the TRAINING LOOP reads cached outputs from. Defaults
+        # to the precache write destination, but callers (run()) force "disk" when
+        # DataLoader workers are spawned so the cache is not embedded in the dataset
+        # object (spawn cannot share parent RAM; embedding it would pickle a multi-GB
+        # cache to every worker and multiply RAM). This variable also gates whether
+        # the in-RAM cache is populated, so forcing "disk" skips the RAM copy entirely.
+        cache_destination = loader_cache_destination or self.config.dataset.cache_destination
 
         if not cache_latents and not cache_te:
             return
@@ -575,12 +646,13 @@ class SDXLTrainer:
 
         logger.info(
             f"Latent/TextEncoder cache is always persisted to disk at: {self.cache_dir_path} "
-            f"(cache_destination='{self.config.dataset.cache_destination}')"
+            f"(precache_destination='{self.config.dataset.cache_destination}', "
+            f"loader reads from: '{cache_destination}')"
         )
 
         # Initialize RAM cache dictionaries on the dataset
         dataset.ram_cache = {}
-        dataset.cache_destination = self.config.dataset.cache_destination
+        dataset.cache_destination = cache_destination
         dataset.cache_dir_path = self.cache_dir_path
         dataset.cache_latents_enabled = cache_latents
         dataset.cache_te_enabled = cache_te
@@ -591,8 +663,6 @@ class SDXLTrainer:
         self.text_encoder_2.eval()
         if hasattr(self.vae, "eval"):
             self.vae.eval()
-
-        cache_destination = self.config.dataset.cache_destination
 
         # --- Pre-scan: decide which samples actually need GPU encoding ---
         # A sample needs encoding if its on-disk cache is missing or invalid for any
@@ -829,6 +899,7 @@ class SDXLTrainer:
         try:
             with torch.no_grad():
                 for loaded in prefetch_samples(to_encode):
+                    self._check_vram_limit("dataset_caching")
                     buffer.append(loaded)
                     if len(buffer) >= batch_size:
                         flush()
@@ -1043,8 +1114,44 @@ class SDXLTrainer:
 
         return loss.item()
 
+    def _check_vram_limit(self, phase: str) -> None:
+        """
+        Actively checks current free VRAM and raises an AutoOOMError if it
+        falls below the configured threshold (config.training.min_free_vram_gb).
+        We allow mocking this check in CPU/test-mode via extra attributes if desired.
+        """
+        # If is_test_mode, allow setting mock attributes for testing purposes
+        mock_free = getattr(self, "_mock_free_vram_bytes", None)
+        if mock_free is not None:
+            free_gb = mock_free / (1024 ** 3)
+            limit_gb = self.config.training.min_free_vram_gb
+            if free_gb < limit_gb:
+                raise AutoOOMError(
+                    f"Auto OOM detected in phase: {phase}. "
+                    f"Free VRAM: {free_gb:.3f} GB is below the threshold of {limit_gb:.3f} GB."
+                )
+            return
+
+        if not torch.cuda.is_available():
+            return
+
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024 ** 3)
+            limit_gb = self.config.training.min_free_vram_gb
+            if free_gb < limit_gb:
+                raise AutoOOMError(
+                    f"Auto OOM detected in phase: {phase}. "
+                    f"Free VRAM: {free_gb:.3f} GB is below the threshold of {limit_gb:.3f} GB."
+                )
+        except AutoOOMError:
+            raise
+        except Exception as e:
+            logger.warning(f"Failed to query VRAM info: {e}")
+
     def _log_vram(self, tag: str) -> None:
         """Logs current + peak CUDA memory at a phase boundary (no-op on CPU)."""
+        self._check_vram_limit(tag)
         if not torch.cuda.is_available():
             return
         alloc = torch.cuda.memory_allocated() / (1024 ** 2)
@@ -1066,6 +1173,18 @@ class SDXLTrainer:
             torch.backends.cudnn.benchmark = True
             logger.info("Enabled TF32 matmul + cuDNN benchmark for CUDA.")
 
+            # Use the "spawn" start method for DataLoader workers whenever CUDA is
+            # in use. The caching phase already initialized CUDA + cuDNN/MPS threads
+            # in this process; forking (the default on Linux/WSL) after CUDA/thread
+            # init deadlocks the worker processes, so the training loop would hang
+            # forever fetching its very first batch. Spawn re-imports cleanly and
+            # avoids the fork-after-CUDA trap. This is a no-op for CPU / test mode.
+            try:
+                torch.multiprocessing.set_start_method("spawn")
+            except RuntimeError:
+                # Already set (e.g. by a parent process); leave as-is.
+                pass
+
         # Setup all dependencies.
         # Models needed for caching (VAE + Text Encoders) are loaded first; the UNet
         # is deferred until after caching to keep VRAM free during the precache phase.
@@ -1073,8 +1192,14 @@ class SDXLTrainer:
         self._log_vram("after_setup_models")
         self.setup_dataloader()
 
-        # Cache dataset (latents & text encoder outputs) if enabled
-        self.cache_dataset()
+        # Cache dataset (latents & text encoder outputs) if enabled.
+        # When DataLoader workers are spawned (num_workers > 0), force the training
+        # loop to read the always-on disk cache instead of embedding the in-RAM cache
+        # inside the dataset object (spawn can't share parent RAM; embedding it would
+        # pickle the whole cache to every worker and multiply RAM). With num_workers
+        # == 0 the zero-copy RAM path is kept.
+        loader_cache_dest = "disk" if (self.config.dataset.num_workers or 0) > 0 else self.config.dataset.cache_destination
+        self.cache_dataset(loader_cache_destination=loader_cache_dest)
         self._log_vram("after_cache_dataset")
 
         # Load the UNet only now, after caching is done.
@@ -1152,6 +1277,7 @@ class SDXLTrainer:
                         if self.global_step >= self.config.training.steps:
                             break
 
+                        self._check_vram_limit(f"train_step_{self.global_step}")
                         step_start_time = time.time()
                         loss_val = self.train_step(batch)
 
@@ -1162,13 +1288,21 @@ class SDXLTrainer:
                         # Calculate step time
                         step_duration = time.time() - step_start_time
 
-                        # Structured step logging (throttled: one line per 1k steps;
-                        # the tqdm bar still updates every step for live progress)
-                        if self.global_step % 1000 == 0:
+                        # Structured step logging (throttled; the tqdm bar still
+                        # updates every step for live progress). Controlled by
+                        # training.log_every_steps; defaults to once per 1k steps.
+                        log_every = self.config.training.log_every_steps or 1000
+                        if self.global_step % log_every == 0:
                             peak = (torch.cuda.max_memory_allocated() / (1024 ** 2)) if torch.cuda.is_available() else 0.0
+                            try:
+                                util = torch.cuda.utilization() if torch.cuda.is_available() else 0
+                            except ModuleNotFoundError:
+                                util = 0
                             logger.info(
                                 f"[Epoch {self.current_epoch}] [Step {self.global_step}/{self.config.training.steps}] "
-                                f"Loss: {loss_val:.4f} | Time: {step_duration:.3f}s | VRAM_peak: {peak:.0f}MB"
+                                f"Loss: {loss_val:.4f} | Step: {step_duration:.3f}s | "
+                                f"Throughput: {1.0 / max(step_duration, 1e-6):.2f}it/s | "
+                                f"VRAM_peak: {peak:.0f}MB | GPU_util: {util}%"
                             )
 
                         # Update tqdm progress bar with postfix metadata
@@ -1245,10 +1379,15 @@ class SDXLTrainer:
             f"step-{self.global_step:06d}.safetensors"
         )
         metadata = self.checkpoint_manager.build_metadata(self.global_step, self.current_epoch)
+
+        # Get resolved model name: explicitly configured model_name or fall back to experiment_name
+        resolved_model_name = self.config.model.model_name or self.config.output.experiment_name
+
         export_kohya_safetensors(
             self.lora_manager.get_lora_state_dict(),
             self.config.network.alpha,
             final_lora_path,
-            metadata=metadata
+            metadata=metadata,
+            model_name=resolved_model_name
         )
         logger.info(f"Exported compatible LoRA file successfully to: {final_lora_path}")

@@ -1,3 +1,6 @@
+> **Note for Reviewers & Users:**  
+> This project is a dedicated **backend training framework**, not an interactive application. It does not provide (and cannot reasonably provide) a runnable live demo or a screen recording. Please see the technical rationale below before evaluating.
+
 # Why There Is No DEMO
 
 > **This project does not provide — and cannot reasonably provide — a runnable DEMO.**
@@ -6,7 +9,7 @@
 
 A "DEMO" for this toolkit would imply one of the following, all of which are impractical or impossible:
 
-1. **Training is GPU-bound and slow.** This is an SDXL LoRA training toolkit, not an inference/demo app. A single meaningful LoRA training run takes thousands of optimizer steps and hours of GPU time. There is no "instant" version that demonstrates real results.
+1. **Training is GPU-bound, slow, and resource-saturating.** This is an SDXL LoRA training toolkit, not an inference app. A single meaningful run takes hours of GPU time under near-100% utilization, making screen recording impractical on the same machine. A video of a terminal output or a 10-hour progress bar demonstrates very little of value anyway.
 2. **No meaningful output without a real dataset + base model.** A LoRA is only useful relative to a specific base model and a specific set of training images. Shipping a canned "demo" run would produce a model that is useless to you, while still requiring the same heavy GPU/VRAM footprint.
 3. **Heavy resource requirements.** Training needs a CUDA-capable GPU with sufficient VRAM, large model weights (several GB), and a dataset of images. These cannot be bundled into a portable demo nor run in a web/CI sandbox.
 4. **Reproducibility, not convenience, is the priority.** The toolkit is built around reproducible, user-controlled YAML configs. The "demo" is your run, on your hardware, with your data.

@@ -1,21 +1,17 @@
 # USAGE
 
-A short, end-to-end guide to training an SDXL LoRA with this toolkit.
-
-> Prerequisites: a CUDA-capable NVIDIA GPU, Python 3.11, and a local SDXL base model (e.g. a `.safetensors` checkpoint).
+> Prerequisites: a NVIDIA GPU, Python 3.11, and a local SDXL base model.
 
 ---
 
 ## 1. Environment setup
 
-It is strongly recommended to use a dedicated virtual environment.
+It is strongly recommended to use a virtual environment.
 
 ```bash
 conda create -n sdxl-training python==3.11.13
 conda activate sdxl-training
 ```
-
-All following commands must run inside this activated environment.
 
 ## 2. Installation
 
@@ -77,8 +73,6 @@ Key fields to change:
 | `optimizer.type`                      | `adamw8bit` (recommended, low VRAM)                                  |
 | `output.experiment_name`              | A name for this run's output folder                                  |
 
-For 12 GB VRAM machines (e.g. RTX 3060 / 4070), the bundled `lora_example.yaml` defaults already target this budget: UNet-only LoRA, `bf16`, `adamw8bit`, `batch_size: 1`.
-
 ## 5. Run training
 
 ```bash
@@ -99,4 +93,4 @@ To resume from the latest valid checkpoint after an interruption, leave `resume.
 
 - **Out of memory (OOM):** enable `training.gradient_checkpointing: true`, set `dataset.batch_size: 1`, enable `dataset.cache_vae_slicing: true`, or set `training.train_text_encoder: false`.
 - **Slow data loading on Windows:** set `dataset.num_workers: 0` for debugging.
-- **No CUDA GPU detected:** the trainer fails gracefully with a clear error. Training requires an NVIDIA CUDA GPU.
+- **No CUDA GPU detected:** Training requires an NVIDIA CUDA GPU.

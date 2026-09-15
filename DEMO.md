@@ -1,23 +1,20 @@
-# Why There Is No DEMO
+# Why There Is No Live Demo
 
-> **This project does not provide — and cannot reasonably provide — a runnable DEMO.**
+Due to the nature of this project, providing a live demo is not practical. This toolkit is designed for training SDXL LoRA models, which requires specific hardware configurations and datasets that are not easily shared or demonstrated in a live environment.
 
-## Why a DEMO is not feasible
+## Demo Video
 
-A "DEMO" for this toolkit would imply one of the following, all of which are impractical or impossible:
+We have created a [demo video](https://youtu.be/1PRoAOIgnng) showcasing the training workflow and results.
 
-1. **Training is GPU-bound and slow.** This is an SDXL LoRA training toolkit, not an inference/demo app. A single meaningful LoRA training run takes thousands of optimizer steps and hours of GPU time. There is no "instant" version that demonstrates real results.
-2. **No meaningful output without a real dataset + base model.** A LoRA is only useful relative to a specific base model and a specific set of training images. Shipping a canned "demo" run would produce a model that is useless to you, while still requiring the same heavy GPU/VRAM footprint.
-3. **Heavy resource requirements.** Training needs a CUDA-capable GPU with sufficient VRAM, large model weights (several GB), and a dataset of images. These cannot be bundled into a portable demo nor run in a web/CI sandbox.
-4. **Reproducibility, not convenience, is the priority.** The toolkit is built around reproducible, user-controlled YAML configs. The "demo" is your run, on your hardware, with your data.
+Note: The video uses only 10 training steps for demonstration purposes. This is not representative of a real training run. The purpose of the video is simply to provide a visual overview of how the toolkit works.
 
-**Conclusion:** The fastest, most honest path is for you to run it yourself. The instructions are short and are documented in [`USAGE.md`](./USAGE.md).
+For actual SDXL LoRA training, we recommend at least 5,000 steps as a starting point for a training.
 
 ## Verified hardware
 
 The following setup has been **confirmed working** by the maintainer. Use it as a known-good reference point when configuring your own run:
 
-You need AT LEAST the following hardware to run SDXL LoRA training with this toolkit:
+You need **AT LEAST** the following hardware to run SDXL LoRA training with this toolkit:
 
 | Item       | Specification                                          |
 | ---------- | ------------------------------------------------------ |
@@ -29,9 +26,3 @@ You need AT LEAST the following hardware to run SDXL LoRA training with this too
 | Base Model | `waiIllustriousSDXL_v160.safetensors`                  |
 
 With this configuration, training at 1024px with UNet-only LoRA (`train_text_encoder: false`), `bf16` mixed precision, and `optimizer.type: adamw8bit` runs comfortably within the 12 GB VRAM budget. If you raise `batch_size`, enable `train_text_encoder`, or train at larger effective resolutions, enable `training.gradient_checkpointing: true` and consider `dataset.cache_vae_slicing: true` to stay within VRAM limits.
-
-## What to do instead
-
-1. Read [`USAGE.md`](./USAGE.md) for a step-by-step walkthrough.
-2. Copy and adapt `configs/examples/lora_example.yaml` for your base model and dataset.
-3. Run `python train.py your_config.yaml`.

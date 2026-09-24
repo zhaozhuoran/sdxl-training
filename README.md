@@ -1,10 +1,30 @@
 # sdxl-training
 
-A lightweight, highly-configurable, and extensible toolkit for SDXL training.
+A lightweight, configurable toolkit for training SDXL models.
 
-## Directory Structure
+## Features
 
+- YAML-based configuration
+- LoRA training
+- Extensible training methods
+- Checkpoint management
+- Dataset and logging utilities
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+pip install -e .
+
+cp configs/examples/lora_example.yaml my_config.yaml
+python train.py my_config.yaml
 ```
+
+See [`USAGE.md`](./USAGE.md) for configuration and training details.
+
+## Structure
+
+```text
 sdxl-training/
 ├── configs/
 │   └── examples/
@@ -26,25 +46,6 @@ sdxl-training/
 └── README.md
 ```
 
-## Getting Started
-
-**[`USAGE.md`](./USAGE.md)**.
-
-Quick start:
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-cp configs/examples/lora_example.yaml my_config.yaml
-python train.py my_config.yaml
-```
-
-## Configuration Reference
-
-The training run is controlled entirely by the YAML config file. An example wcan be found in `configs/examples/lora_example.yaml`.
-
-You can also read [`USAGE.md`](./USAGE.md).
-
 ## License
 
-This project is licensed under the GNU Affero General Public License v3 (AGPLv3) - see the [LICENSE](./LICENSE) file for details.
+[AGPL-3.0](./LICENSE)

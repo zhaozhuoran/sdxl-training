@@ -84,7 +84,7 @@ class TrainingConfig(BaseModel):
 
 
 class NetworkConfig(BaseModel):
-    type: str = Field("lora", description="Network type. Currently only 'lora' is supported in the MVP.")
+    type: str = Field("lora", description="Network type. Only 'lora' is supported.")
     rank: int = Field(64, description="Rank of LoRA network.")
     alpha: float = Field(32.0, description="Alpha parameter of LoRA network.")
 
@@ -174,7 +174,7 @@ class TrainingPipelineConfig(BaseModel):
 
 
 def load_config(path: Union[str, Path]) -> TrainingPipelineConfig:
-    """Loads and strongly validates the YAML configuration file."""
+    """Read a YAML file and validate its training settings."""
     with open(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not data:

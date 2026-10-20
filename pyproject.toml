@@ -1,7 +1,7 @@
 [project]
 name = "sdxl-training"
 version = "0.1.0"
-description = "A lightweight, configurable, and extensible toolkit for SDXL training."
+description = "Train SDXL LoRA adapters from image-caption datasets."
 authors = []
 requires-python = ">=3.10"
 readme = "README.md"
@@ -26,7 +26,7 @@ dependencies = [
 xformers = ["xformers==0.0.28.post3"]
 
 [project.scripts]
-sdxl-train = "train:main"
+sdxl-train = "trainer.cli:main"
 
 [tool.poetry]
 packages = [

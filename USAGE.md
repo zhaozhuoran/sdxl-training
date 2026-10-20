@@ -1,96 +1,113 @@
-# USAGE
+# Training
 
-> Prerequisites: a NVIDIA GPU, Python 3.11, and a local SDXL base model.
+## Install
 
----
-
-## 1. Environment setup
-
-It is strongly recommended to use a virtual environment.
+Use Python 3.11 for the pinned dependency set. SDXL training requires an NVIDIA
+CUDA GPU; CPU mode is only for tests with mock models.
 
 ```bash
-conda create -n sdxl-training python==3.11.13
-conda activate sdxl-training
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python -m pip install -e .
 ```
 
-## 2. Installation
+`requirements.txt` includes xformers for the pinned PyTorch version. The trainer
+uses diffusers' default attention if xformers is unavailable. The 8-bit AdamW
+optimizer uses bitsandbytes; without it the trainer falls back to PyTorch AdamW,
+which uses more memory.
 
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
+## Dataset
 
-Optional, for lower UNet attention memory (must match your torch build):
+Put images and UTF-8 captions in one directory:
 
-```bash
-pip install .[xformers]
-```
-
-Without it, the trainer automatically falls back to SDPA attention.
-
-## 3. Prepare your dataset
-
-Use the image-caption directory format. Every image needs a matching UTF-8 `.txt` caption with the same base filename:
-
-```
+```text
 dataset/
-    00001.png
-    00001.txt
-    00002.webp
-    00002.txt
+  00001.png
+  00001.txt
+  00002.webp
+  00002.txt
 ```
 
-- Supported image formats: `png`, `jpg/jpeg`, `webp`
-- One caption line per `.txt` file (Kohya-style comma-separated tags work well).
+The loader reads PNG, JPEG, and WebP files directly inside this folder. It does
+not search subdirectories. A missing caption is treated as an empty string.
+Images are resized and center-cropped into aspect-ratio buckets.
 
-## 4. Configure your run
-
-Copy the example config and edit it for your setup:
+## Configure and run
 
 ```bash
 cp configs/examples/lora_example.yaml my_config.yaml
 ```
 
-Key fields to change:
-
-| Field                                 | What to set                                                          |
-| ------------------------------------- | -------------------------------------------------------------------- |
-| `model.pretrained_model_name_or_path` | Path to your base model, e.g. `waiIllustriousSDXL_v160.safetensors`  |
-| `model.vae_path`                      | `null` to use the base model's VAE, or a custom VAE path             |
-| `dataset.path`                        | Path to your image-caption dataset folder                            |
-| `dataset.resolution`                  | `1024` (standard SDXL)                                               |
-| `dataset.batch_size`                  | `1` on 12 GB VRAM; raise only if you have headroom                   |
-| `dataset.cache_latents`               | `true` (default) to cache VAE latents; `false` to disable            |
-| `dataset.cache_text_encoder_outputs`  | `true` (default) to cache TE outputs when `train_text_encoder` is false|
-| `dataset.cache_destination`           | `"ram"` (default, stores in memory) or `"disk"` (saves cache files)  |
-| `dataset.cache_workers`               | Number of parallel threads to load images/caches (default: `8`)      |
-| `dataset.cache_vae_slicing`           | `true` to slice VAE encoding to save peak VRAM during precaching     |
-| `dataset.cache_vae_dtype`             | `"fp32"` (safe default) or `"bf16"` (faster, lower peak VRAM)        |
-| `training.mixed_precision`            | `bf16` (recommended) or `fp16`                                       |
-| `training.train_text_encoder`         | `false` (UNet-only) to save VRAM; `true` only if you have spare VRAM |
-| `training.gradient_checkpointing`     | `true` if you hit OOM or raise batch size / train text encoders      |
-| `network.rank` / `network.alpha`      | `64` / `32` is a good default                                        |
-| `optimizer.type`                      | `adamw8bit` (recommended, low VRAM)                                  |
-| `output.experiment_name`              | A name for this run's output folder                                  |
-
-## 5. Run training
+Set `model.pretrained_model_name_or_path`, `dataset.path`, and
+`output.experiment_name` before running:
 
 ```bash
 python train.py my_config.yaml
+# Equivalent after installation:
+sdxl-train my_config.yaml
 ```
 
-To resume from the latest valid checkpoint after an interruption, leave `resume.mode: "auto"` (the default). To start fresh, set it to `"none"`.
+The model can be a diffusers directory, a Hugging Face model ID, or a local
+`.safetensors` / `.ckpt` file. Single-file loading uses `local_files_only=True`,
+so its supporting model configuration and tokenizers must be available locally.
 
-## 6. Check progress and outputs
+The example trains only the UNet adapters at 1024 resolution, with batch size 1,
+rank 64, alpha 32, and `bf16` precision. These are example settings, not a memory
+or output-quality guarantee. Set `training.mixed_precision` to `fp16` or `no`
+if your hardware does not support `bf16`.
 
-- Checkpoints and LoRA exports are written under `output.directory / output.experiment_name/` (default `outputs/test_lora_run/`).
-- Rolling recovery checkpoints (`save_every_steps`) and preserved snapshots (`snapshot_every_steps`) are created per your config.
-- The final LoRA is exported as a `.safetensors` file in Kohya format with standard `__metadata__`, compatible with AUTOMATIC1111, ComfyUI, and Forge.
+## Memory and caching
 
----
+- `dataset.cache_latents` caches VAE outputs.
+- `dataset.cache_text_encoder_outputs` caches text embeddings when the text
+  encoders are frozen. Disable it for whole-caption dropout.
+- `dataset.cache_destination` selects RAM or disk reads. With DataLoader workers
+  enabled, the trainer uses disk reads to avoid copying the RAM cache into each
+  worker. Both modes write a disk cache for reuse on later runs.
+- `dataset.cache_dir` overrides the default sibling `<dataset>.cache_latents`
+  directory.
 
-## Troubleshooting
+If caching runs out of GPU memory, lower `dataset.cache_batch_size` or enable
+`dataset.cache_vae_slicing`. If the training loop runs out of memory, keep batch
+size at 1, enable `training.gradient_checkpointing`, or leave
+`training.train_text_encoder` disabled.
 
-- **Out of memory (OOM):** enable `training.gradient_checkpointing: true`, set `dataset.batch_size: 1`, enable `dataset.cache_vae_slicing: true`, or set `training.train_text_encoder: false`.
-- **Slow data loading on Windows:** set `dataset.num_workers: 0` for debugging.
-- **No CUDA GPU detected:** Training requires an NVIDIA CUDA GPU.
+`network.unet_targets` and the text encoder target lists match substrings of
+module names. They do not accept regular expressions. Leave them `null` to use
+the built-in targets.
+
+## Outputs and recovery
+
+Each run is stored under `output.directory / output.experiment_name`:
+
+```text
+config.yaml
+logs/train.log
+checkpoints/
+  latest/
+  recovery/recovery-000100.pt
+  snapshots/snapshot-000500.pt
+  lora/step-001000.safetensors
+```
+
+Recovery files are rotated according to `checkpoint.keep_last_recovery`;
+snapshots are retained. Both contain the adapter weights and training state.
+The final `.safetensors` file contains the adapter for inference.
+
+The example sets `resume.mode: auto`: it tries recovery checkpoints from newest
+to oldest, then snapshots if none of the recovery files are valid. Set the mode
+to `none` to start from scratch, preferably with a new experiment name. For a
+specific checkpoint, use `manual` and set `resume.manual_path` to its `.pt` file.
+The configuration default, when the resume section is omitted, is `none`.
+
+## CPU smoke test
+
+```bash
+python -m pip install pytest
+python -m pytest -q tests/test_trainer_integration.py
+```
+
+These tests create temporary images and use tiny mock networks. The CLI also
+has `--test-mode` for this purpose; its exports are test artifacts, not trained
+SDXL adapters.

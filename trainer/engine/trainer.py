@@ -25,19 +25,13 @@ class AutoOOMError(RuntimeError):
 
 
 class SDXLTrainer:
-    """
-    Core, high-performance, and extensible SDXL LoRA Training Engine.
-    Handles component setup, the custom training loop, precision scaling,
-    checkpoints intervals, and automated resume recovery.
-    """
+    """Load SDXL components, train adapters, and save or resume training state."""
     def __init__(self, config_path: str, is_test_mode: bool = False):
         self.config_path = config_path
         self.is_test_mode = is_test_mode
 
-        # 1. Load and strongly validate configuration
         self.config: TrainingPipelineConfig = load_config(config_path)
 
-        # 2. Setup output directories
         self.output_dir = os.path.join(self.config.output.directory, self.config.output.experiment_name)
 
         # Check compatibility before overwriting if resuming
@@ -84,11 +78,10 @@ class SDXLTrainer:
             config_hash=self.config_hash
         )
 
-        # 3. Handle strict GPU requirements for production runs
         if not self.is_test_mode and not torch.cuda.is_available():
             raise RuntimeError(
-                "CUDA-compatible GPU is unavailable. This framework is GPU-first, and CPU training is intentionally "
-                "unsupported to prevent unintended config errors and impractical execution times. Exiting."
+                "CUDA-compatible GPU is unavailable. SDXL training requires an NVIDIA GPU. "
+                "Use --test-mode only for smoke tests with mock models."
             )
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -113,7 +106,7 @@ class SDXLTrainer:
         self.current_epoch = 0
 
     def _get_git_commit(self) -> str:
-        """Helper to safely query current git commit if in repository context."""
+        """Return the commit recorded in checkpoint metadata, or 'unknown'."""
         try:
             import subprocess
             res = subprocess.run(
@@ -208,9 +201,6 @@ class SDXLTrainer:
             self.noise_scheduler = MockNoiseScheduler()
             return
 
-        # Real model loading
-        # In actual execution, we load the standard diffusers components
-        # (this requires diffusers and transformers packages)
         from diffusers import AutoencoderKL, DDPMScheduler
         from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
 
@@ -332,8 +322,8 @@ class SDXLTrainer:
             )
 
     def setup_lora(self) -> None:
-        """Injects generic parameter-efficient LoRA wrapper modules into model components."""
-        logger.info("Injecting customizable parameter-efficient LoRA layers...")
+        """Attach adapters to the UNet and, optionally, both text encoders."""
+        logger.info("Injecting LoRA layers...")
         self.lora_manager = LoRAInjectionManager(
             rank=self.config.network.rank,
             alpha=self.config.network.alpha,
@@ -356,7 +346,7 @@ class SDXLTrainer:
             wrapper.to(self.device, dtype=self.weight_dtype)
 
     def setup_optimizer(self) -> None:
-        """Initializes requested optimizer on our isolated parameters."""
+        """Build the optimizer using only adapter parameters."""
         params = self.lora_manager.get_lora_parameters()
         opt_type = self.config.optimizer.type.lower()
         lr = self.config.optimizer.learning_rate
@@ -400,7 +390,7 @@ class SDXLTrainer:
             raise ValueError(f"Unsupported optimizer: {opt_type}")
 
     def setup_scheduler(self) -> None:
-        """Builds learning rate scheduling behaviors."""
+        """Build a constant or cosine schedule with optional warmup."""
         total_steps = self.config.training.steps
         warmup_steps = self.config.scheduler.warmup_steps
         sched_type = self.config.scheduler.type.lower()
@@ -427,7 +417,7 @@ class SDXLTrainer:
             raise ValueError(f"Unsupported scheduler type: {sched_type}")
 
     def setup_dataloader(self) -> None:
-        """Creates dataset loader pipeline from image-caption folder."""
+        """Create the dataset and bucketed batch loader."""
         from trainer.caption import CaptionProcessor
 
         ds = self.config.dataset
@@ -1030,31 +1020,25 @@ class SDXLTrainer:
                 loss = torch.mean((output - 0.0) ** 2)
             else:
                 # Real SDXL forward pass
-                # 1. Get or encode images to latents
                 if "latents" in batch:
                     latents = batch["latents"].to(self.device, dtype=dtype, non_blocking=True)
                 else:
                     if self.vae.device != self.device:
                         self.vae.to(self.device)
                     pixel_values = batch["pixel_values"].to(self.device, dtype=self.vae.dtype, non_blocking=True)
-                    # Pass through standard VAE to extract latents
                     latents = self.vae.encode(pixel_values).latent_dist.sample()
                     latents = latents * self.vae.config.scaling_factor
                     latents = latents.to(dtype)
 
-                # 2. Add noise mathematically correctly using DDPMScheduler
                 noise = torch.randn_like(latents)
-                # Sample random timestep
                 timesteps = torch.randint(
                     0,
                     getattr(self.noise_scheduler.config, "num_train_timesteps", 1000),
                     (latents.shape[0],),
                     device=self.device
                 ).long()
-                # Use standard noise scheduler API
                 noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # 3. Get or encode prompt captions
                 if "prompt_embeds" in batch:
                     prompt_embeds = batch["prompt_embeds"].to(self.device, dtype=dtype, non_blocking=True)
                     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(self.device, dtype=dtype, non_blocking=True)
@@ -1069,7 +1053,7 @@ class SDXLTrainer:
                     prompt_embeds = prompt_embeds.to(dtype)
                     pooled_prompt_embeds = pooled_prompt_embeds.to(dtype)
 
-                # 4. SDXL micro-conditioning from the REAL per-image original size / crop.
+                # SDXL conditioning uses image-space dimensions and crop offsets.
                 add_time_ids = self._get_add_time_ids(
                     batch["true_original_sizes"], batch["crop_originals"], batch["bucket_sizes"]
                 )
@@ -1079,7 +1063,6 @@ class SDXLTrainer:
                     "time_ids": add_time_ids
                 }
 
-                # 5. Execute noise prediction using UNet
                 noise_pred = self.unet(
                     noisy_latents,
                     timesteps,
@@ -1087,7 +1070,6 @@ class SDXLTrainer:
                     added_cond_kwargs=added_cond_kwargs
                 ).sample
 
-                # 6. L2 Loss
                 loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
         # Scale the loss so gradients average correctly over the accumulation
@@ -1373,7 +1355,7 @@ class SDXLTrainer:
         self._log_vram("after_training")
 
         # Post training: Export final LoRA safetensors to lora directory
-        logger.info("Training completed successfully. Exporting final compatible LoRA safetensors...")
+        logger.info("Training complete. Exporting LoRA weights...")
         final_lora_path = os.path.join(
             self.checkpoint_manager.lora_dir,
             f"step-{self.global_step:06d}.safetensors"
@@ -1390,4 +1372,4 @@ class SDXLTrainer:
             metadata=metadata,
             model_name=resolved_model_name
         )
-        logger.info(f"Exported compatible LoRA file successfully to: {final_lora_path}")
+        logger.info("Exported LoRA to %s", final_lora_path)

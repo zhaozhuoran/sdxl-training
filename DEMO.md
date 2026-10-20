@@ -1,28 +1,29 @@
-# Why There Is No Live Demo
+# Demo
 
-Due to the nature of this project, providing a live demo is not practical. This toolkit is designed for training SDXL LoRA models, which requires specific hardware configurations and datasets that are not easily shared or demonstrated in a live environment.
+[Existing training recording](https://youtu.be/1PRoAOIgnng)
 
-## Demo Video
+The recording shows a 10-step run. It demonstrates starting the trainer and
+writing outputs; it does not demonstrate a finished LoRA's image quality.
+The recording has been reported to contain long black sections and needs a
+replacement capture. The source video is not included in this repository.
 
-We have created a [demo video](https://youtu.be/1PRoAOIgnng) showcasing the training workflow and results.
+## Replacement recording
 
-Note: The video uses only 10 training steps for demonstration purposes. This is not representative of a real training run. The purpose of the video is simply to provide a visual overview of how the toolkit works.
+Keep the terminal and configuration visible. Show the dataset layout, start the
+run, and show the exported `.safetensors` file when it finishes. Cut loading
+waits and blank footage, and label any time skips. If showing generated images,
+include the prompt, seed, base model, and LoRA strength so the comparison can be
+repeated.
 
-For actual SDXL LoRA training, we recommend at least 5,000 steps as a starting point for a training.
+Watch the exported file from start to finish before uploading it, then replace
+the link above. A CPU mock run should be labeled as a software smoke test.
 
-## Verified hardware
+## Previously reported setup
 
-The following setup has been **confirmed working** by the maintainer. Use it as a known-good reference point when configuring your own run:
+The maintainer previously reported a run with Ubuntu 24.04, 64 GB RAM, 12 GB
+VRAM, an NVMe SSD, and roughly 2,500 images at up to 1024px, using
+`waiIllustriousSDXL_v160.safetensors`. The settings were UNet-only training,
+`bf16`, and `adamw8bit`.
 
-You need **AT LEAST** the following hardware to run SDXL LoRA training with this toolkit:
-
-| Item       | Specification                                          |
-| ---------- | ------------------------------------------------------ |
-| OS         | Ubuntu 24.04 LTS                                       |
-| System RAM | 64 GB                                                  |
-| GPU VRAM   | 12 GB                                                  |
-| Storage    | NVMe SSD (recommended for latent/text-encoder caching) |
-| Dataset    | ≤ 1024px resolution, ~2.5k images                      |
-| Base Model | `waiIllustriousSDXL_v160.safetensors`                  |
-
-With this configuration, training at 1024px with UNet-only LoRA (`train_text_encoder: false`), `bf16` mixed precision, and `optimizer.type: adamw8bit` runs comfortably within the 12 GB VRAM budget. If you raise `batch_size`, enable `train_text_encoder`, or train at larger effective resolutions, enable `training.gradient_checkpointing: true` and consider `dataset.cache_vae_slicing: true` to stay within VRAM limits.
+This is a reported configuration, not a measured minimum requirement. Memory
+use depends on the model, bucket sizes, batch size, and caching settings.

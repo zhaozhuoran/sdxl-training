@@ -1,20 +1,7 @@
-"""Aspect-ratio bucketing (SDXL LoRA training).
+"""Group images into size buckets for batches with matching tensor shapes.
 
-Our own, self-contained implementation inspired by the bucket concept used in
-kohya-ss/sd-scripts, but with a simpler/cleaner API tailored to this trainer.
-
-Key ideas
----------
-* A set of ``(width, height)`` buckets is generated around a base resolution.
-  Every bucket has both dimensions as multiples of ``bucket_step`` (8-safe for
-  the VAE which downscales by 8).
-* Each image is assigned to the bucket whose aspect ratio is closest to the
-  image's own aspect ratio. The image is resized (preserving aspect ratio,
-  scaling to *cover* the bucket) and then center-cropped to the exact bucket
-  size.
-* The size the image had *before* the center crop (``original_size``) and the
-  crop offsets (``crop_ltrb``) are recorded. SDXL micro-conditioning
-  (``add_time_ids``) needs the real original size and crop, not a fake constant.
+Sizes use (width, height). Pixel crops use resized-image coordinates; SDXL
+conditioning keeps the source-image size and crop offsets separately.
 """
 
 import random

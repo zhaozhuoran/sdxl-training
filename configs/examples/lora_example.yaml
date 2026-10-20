@@ -1,259 +1,76 @@
-# ==============================================================================
-# SDXL LoRA Training - Example YAML Configuration
-# ==============================================================================
-# This configuration file is used to control all aspects of the SDXL training pipeline.
-# It is designed to be highly readable, modular, strongly validated, and extensible.
-# All parameters can be customized for your dataset and hardware configurations.
-
-# ------------------------------------------------------------------------------
-# 1. Model Configuration
-# ------------------------------------------------------------------------------
+# Copy this file and set the model, dataset path, and experiment name.
 model:
-  # The name of the model, used as model metadata (e.g., ss_output_name).
-  # Options/Optional values: "my_sdxl_lora", null
-  model_name: null
-
-  # Path to pretrained SDXL base model (can be a local directory or HF model hub ID)
-  # Examples: "stabilityai/stable-diffusion-xl-base-1.0", "path/to/local/sdxl_base"
+  model_name: null  # Export name; null uses output.experiment_name.
   pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
-
-  # Optional path to a custom VAE model. If null, the VAE from the base model is used.
-  # Value: string (e.g., "madebyollin/sdxl-vae-fp16-fix") or null
   vae_path: null
 
-# ------------------------------------------------------------------------------
-# 2. Dataset Configuration
-# ------------------------------------------------------------------------------
 dataset:
-  # Path to the dataset directory containing image-caption pairs (e.g. 001.png, 001.txt)
-  path: "tests/fixtures/dataset"
-
-  # Batch size per GPU step. Higher values speed up training but require more VRAM.
-  # Options/Optional values: 1, 2, 4, 8
+  path: "dataset"  # Your image-caption folder; no dataset is bundled.
   batch_size: 1
-
-  # Training resolution. Images will be automatically resized and center-cropped.
-  # Options/Optional values: 1024, 768, 512 (1024 is recommended for standard SDXL)
   resolution: 1024
-
-  # Shuffle the training samples every epoch to improve model generalization.
-  # Options/Optional values: true, false
   shuffle: true
+  num_workers: 4  # Use 0 to load data in the training process.
 
-  # Number of worker threads for background data preprocessing.
-  # Options/Optional values: 0, 2, 4, 8 (use 0 for single-thread/debug on Windows)
-  num_workers: 4
-
-  # Pre-computes and caches VAE latents once to save VRAM and training time.
-  # Default: true
   cache_latents: true
-
-  # Pre-computes and caches Text Encoder outputs once, only if train_text_encoder is false.
-  # Default: true
-  cache_text_encoder_outputs: true
-
-  # Destination for pre-computed caches: "ram" (stores in memory) or "disk" (saves to cache files).
-  # Default: "ram"
-  cache_destination: "ram"
-
-  # Custom directory path for disk caching. If null, defaults to a sibling "<dataset>.cache_latents"
-  # directory next to the dataset folder (e.g. "/path/dataset" -> "/path/dataset.cache_latents").
-  # The latent/TextEncoder cache is ALWAYS written to disk (kohya-style) regardless of cache_destination,
-  # so reruns load instantly instead of re-encoding. Set this to override the default location.
-  # Default: null
-  cache_dir: null
-
-  # Number of worker threads used to load images and read disk caches in parallel during precaching.
-  # This overlaps slow I/O (e.g. datasets on network/USB mounts) with GPU encoding.
-  # Options/Optional values: 0 (serial), 4, 8 (recommended), 16
+  cache_text_encoder_outputs: true  # Only used when text encoders are frozen.
+  cache_destination: "ram"  # Workers use disk reads instead of copying RAM caches.
+  cache_dir: null  # Both modes write to <dataset>.cache_latents unless overridden.
   cache_workers: 8
-
-  # Number of samples encoded together on the GPU during precaching (batched VAE/Text Encoder passes).
-  # Higher is faster (better GPU utilization) but uses more peak VRAM; freed each batch via torch.cuda.empty_cache().
-  # Options/Optional values: 1 (serial), 2 (default), 4, 8, 16
-  cache_batch_size: 2
-
-  # Slice the VAE encode to cap peak VRAM during precaching. Default off (speed-first);
-  # enable (true) on VRAM-constrained GPUs. Peak VRAM is reclaimed each batch regardless.
-  # Options/Optional values: false (default, faster), true (lower peak VRAM)
+  cache_batch_size: 2  # Lower this if precaching runs out of GPU memory.
   cache_vae_slicing: false
+  cache_vae_dtype: "fp32"  # Also accepts bf16.
 
-  # Precision for the VAE encode during precaching.
-  # Options/Optional values: "fp32" (default, safe), "bf16" (lower peak VRAM + faster via autocast; slight quality risk)
-  cache_vae_dtype: "fp32"
-
-  # --- Aspect-ratio bucketing ---
-  # Images are assigned to the bucket whose aspect ratio is closest to their own,
-  # resized (preserving aspect ratio, scaling to cover) and center-cropped. This
-  # avoids the distortion of forcing every image to a single square resolution.
-  # Both bucket dimensions are multiples of bucket_step (must be 8-safe for the VAE).
-  # Options/Optional values: 32, 64 (recommended), 128
+  # Bucket dimensions are multiples of bucket_step; images are resized and cropped.
   bucket_step: 64
+  bucket_min_size: null  # Defaults to bucket_step.
+  bucket_max_size: null  # Defaults to 1.5 times resolution, rounded to a step.
 
-  # Minimum / maximum bucket dimension in pixels. null = sensible defaults
-  # (min = bucket_step, max = 1.5x resolution). Raise max_size for very wide/tall images.
-  # Options/Optional values: null, or any multiple of bucket_step (e.g. 512, 1536)
-  bucket_min_size: null
-  bucket_max_size: null
-
-  # --- Caption augmentations (Kohya-style) ---
-  # Shuffle comma-separated tags (keeping the first keep_tokens fixed in place).
-  # Options/Optional values: true, false
   shuffle_caption: false
-
-  # Number of leading comma-separated tags to keep in place when shuffle_caption is enabled.
-  # Options/Optional values: 0, 1, 2
-  keep_tokens: 0
-
-  # Probability of dropping the WHOLE caption (empty) at training time.
-  # Requires cache_text_encoder_outputs=false (otherwise the dropout cannot be applied to cached embeddings).
-  # Options/Optional values: 0.0 (disabled), 0.05, 0.1
-  caption_dropout_rate: 0.0
-
-  # Probability of dropping each individual comma-separated tag.
-  # Options/Optional values: 0.0 (disabled), 0.05, 0.1
+  keep_tokens: 0  # Leading comma-separated tags excluded from shuffling.
+  caption_dropout_rate: 0.0  # Requires cache_text_encoder_outputs: false.
   tag_dropout_rate: 0.0
 
-# ------------------------------------------------------------------------------
-# 3. Training Loop & Precision Configuration
-# ------------------------------------------------------------------------------
 training:
-  # Total number of global training steps.
-  # Options/Optional values: Any positive integer (e.g., 1000, 2000, 5000)
   steps: 1000
-
-  # Random seed for training determinism and reproducibility.
-  # Options/Optional values: null or any integer (e.g., 42)
   seed: 42
-
-  # Number of steps to accumulate gradients before performing optimizer update.
-  # Options/Optional values: 1, 2, 4, 8
   gradient_accumulation_steps: 1
-
-  # Enable gradient checkpointing to dramatically save VRAM at a slight speed cost.
-  # Options/Optional values: true, false
-  # For UNet-only LoRA at batch_size=1 (e.g. on an RTX 3060) there is usually VRAM
-  # headroom, so leaving this off recovers ~20-30% training speed. Enable (true) if
-  # you hit OOM or raise the batch size / train text encoders.
-  gradient_checkpointing: false
-
-  # Mixed precision mode. Highly recommended to use "bf16" (bfloat16) or "fp16" (float16).
-  # Options/Optional values: "bf16" (strongly recommended for modern GPUs), "fp16", "no"
-  mixed_precision: "bf16"
-
-  # Whether to train the Text Encoders. If false, we disable Text Encoder LoRA injection and only train UNet.
-  # Default: false (UNet only)
+  gradient_checkpointing: false  # Enable to trade speed for lower memory use.
+  mixed_precision: "bf16"  # bf16, fp16, or no.
   train_text_encoder: false
+  log_every_steps: null  # null uses the trainer's 1000-step logging interval.
 
-  # If set, log per-step GPU time, throughput (it/s), peak VRAM and GPU util every N
-  # steps. Options/Optional values: null (disabled), or any positive integer (e.g., 10, 50)
-  log_every_steps: null
-
-# ------------------------------------------------------------------------------
-# 4. Network Parameter Configuration (LoRA)
-# ------------------------------------------------------------------------------
 network:
-  # The method name. Currently supports "lora".
   type: "lora"
-
-  # Network dimension (rank) of the low-rank adapters. Higher dimensions can capture
-  # finer details but require more parameters and memory.
-  # Options/Optional values: 16, 32, 64, 128
   rank: 64
-
-  # Network Alpha scaling parameter. Controls the weight/intensity of the LoRA model.
-  # Options/Optional values: 16, 32, 64, 128 (Typically set to rank/2 or equal to rank)
-  alpha: 32.0
-
-  # Optional lists of target modules for injection (supports custom substrings/regex).
-  # If set to null, the framework defaults to standard SDXL attention layers.
+  alpha: 32.0  # Adapter output is scaled by alpha / rank.
+  # Custom targets match substrings of module names, not regexes.
   unet_targets: null
   text_encoder_1_targets: null
   text_encoder_2_targets: null
 
-# ------------------------------------------------------------------------------
-# 5. Optimizer Configuration
-# ------------------------------------------------------------------------------
 optimizer:
-  # Optimizer algorithm. Use "adamw8bit" to significantly reduce VRAM footprint.
-  # Options/Optional values: "adamw8bit" (recommended), "adamw"
-  type: "adamw8bit"
-
-  # Learning rate for training.
-  # Options/Optional values: 1e-5, 5e-5, 1e-4 (recommended default is 1e-4)
+  type: "adamw8bit"  # Requires bitsandbytes; otherwise falls back to AdamW.
   learning_rate: 1e-4
-
-  # L2 penalty weight decay.
-  # Options/Optional values: 1e-2, 1e-3, 1e-4
   weight_decay: 1e-2
-
-  # Coefficients used for computing running averages of gradient and its square.
   beta1: 0.9
   beta2: 0.999
-
-  # Term added to denominator to improve numerical stability.
   epsilon: 1e-8
 
-# ------------------------------------------------------------------------------
-# 6. Learning Rate Scheduler Configuration
-# ------------------------------------------------------------------------------
 scheduler:
-  # Learning rate scheduler type.
-  # Options/Optional values: "constant", "cosine" (decaying learning rate)
-  type: "cosine"
-
-  # Number of steps to linearly warmup the learning rate from 0 to target value.
-  # Options/Optional values: Any positive integer (e.g., 0, 100, 500)
+  type: "cosine"  # Also accepts constant.
   warmup_steps: 100
 
-# ------------------------------------------------------------------------------
-# 7. Checkpointing, Retention & Validation Configuration
-# ------------------------------------------------------------------------------
 checkpoint:
-  # Save rolling recovery checkpoints (used for crash recovery) every N steps.
-  # Options/Optional values: null (disable step-based), or any integer (e.g., 100, 250)
   save_every_steps: 100
-
-  # Optional save interval by seconds (e.g., save every 300 seconds).
-  # Options/Optional values: null (disable time-based), or any integer (e.g., 300)
   save_every_seconds: null
-
-  # Number of latest recovery checkpoints to keep in rolling history.
-  # Options/Optional values: Any positive integer (e.g., 3, 5, 120)
   keep_last_recovery: 5
-
-  # Save long-term snapshot checkpoints (preserved indefinitely) every N steps.
-  # Options/Optional values: null (disable step-based), or any integer (e.g., 500, 1000)
-  snapshot_every_steps: 500
-
-  # Optional save interval by seconds for snapshots (e.g., save every 1800 seconds).
-  # Options/Optional values: null, or any integer (e.g., 1800)
+  snapshot_every_steps: 500  # Snapshots are kept indefinitely.
   snapshot_every_seconds: null
 
-# ------------------------------------------------------------------------------
-# 8. Resume & Disaster Recovery Configuration
-# ------------------------------------------------------------------------------
 resume:
-  # Recovery mode.
-  # - "none": Start training from scratch.
-  # - "auto": Scan, validate state correctness, and load the newest valid checkpoint
-  #           (recovering from corrupted checkpoints by falling back to snapshots).
-  # - "manual": Specify a direct path in manual_path.
-  # Options/Optional values: "none", "auto", "manual"
-  mode: "auto"
-
-  # Direct path to a recovery or snapshot .pt file. Only required when mode is "manual".
-  # Options/Optional values: null or path string (e.g., "outputs/test_run/checkpoints/recovery/recovery-000200.pt")
+  mode: "auto"  # none starts fresh; manual uses manual_path.
   manual_path: null
 
-# ------------------------------------------------------------------------------
-# 9. Output Directory Management Configuration
-# ------------------------------------------------------------------------------
 output:
-  # Base outputs directory.
-  # Options/Optional values: "outputs/", "runs/" or any other directory name
   directory: "outputs/"
-
-  # Name of current training experiment. Outputs are structured under directory/experiment_name/.
-  # Options/Optional values: Any valid directory name string
   experiment_name: "test_lora_run"

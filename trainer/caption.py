@@ -1,15 +1,8 @@
-"""Caption processing for SDXL LoRA training.
+"""Shuffle comma-separated tags and apply tag or whole-caption dropout.
 
-Implements Kohya-style augmentations applied to comma-separated tag captions:
-* ``shuffle_caption``  - randomly shuffle the comma-separated tags (keeping the
-  first ``keep_tokens`` tags fixed in place, matching Kohya's ``--shuffle_caption``
-  / ``--keep_tokens``).
-* ``tag_dropout_rate`` - randomly drop individual tags with the given probability.
-* ``caption_dropout_rate`` - randomly replace the whole caption with an empty
-  string (used at training time; incompatible with caching TE outputs).
-
-Each processor is constructed from a config subset and is deterministic-free
-beyond ``random``; callers may call ``process`` repeatedly to get fresh variants.
+The processor owns an RNG whose state can be saved in training checkpoints.
+Whole-caption dropout is applied during training and requires uncached text
+embeddings.
 """
 
 import random

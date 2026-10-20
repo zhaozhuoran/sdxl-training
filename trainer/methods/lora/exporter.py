@@ -1,78 +1,34 @@
+from typing import Dict, Optional
+
 import torch
-from typing import Dict, Any, Optional
 from safetensors.torch import save_file
 
 
-def convert_trainer_to_kohya_format(lora_state_dict: Dict[str, torch.Tensor], alpha: float) -> Dict[str, torch.Tensor]:
+def convert_trainer_to_kohya_format(
+    lora_state_dict: Dict[str, torch.Tensor], alpha: float
+) -> Dict[str, torch.Tensor]:
+    """Map model paths to Kohya keys and add each layer's alpha tensor.
+
+    For example, unet.attn.to_q.lora_down.weight becomes
+    lora_unet_attn_to_q.lora_down.weight.
     """
-    Converts our internal LoRA model paths and state dict keys to the standard,
-    ecosystem-compatible Kohya-ss format keys. This allows direct loading into
-    AUTOMATIC1111, ComfyUI, etc.
+    converted = {}
+    prefixes = {"unet": "lora_unet_", "te1": "lora_te1_", "te2": "lora_te2_"}
 
-    Internal keys format:
-      - unet.model.name...to_q.lora_down.weight
-      - te1.text_model.encoder...q_proj.lora_down.weight
-      - te2.text_model.encoder...q_proj.lora_down.weight
+    for key, tensor in lora_state_dict.items():
+        component, _, path = key.partition(".")
+        prefix = prefixes.get(component, "lora_custom_")
+        if component not in prefixes:
+            path = key
 
-    Kohya format keys format:
-      - lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.lora_down.weight
-      - lora_te1_text_model_encoder_layers_0_self_attn_q_proj.lora_down.weight
-      - lora_te2_text_model_encoder_layers_0_self_attn_q_proj.lora_down.weight
+        for suffix in (".lora_down.weight", ".lora_up.weight"):
+            if path.endswith(suffix):
+                layer_name = prefix + path[:-len(suffix)].replace(".", "_")
+                converted[layer_name + suffix] = tensor
+                converted[layer_name + ".alpha"] = torch.tensor(alpha, dtype=torch.float32)
+                break
 
-    Additionally, Kohya expects an alpha parameter stored for each key, e.g.:
-      - lora_unet_down_blocks_0_attentions_0_transformer_blocks_0_attn1_to_q.alpha
-    """
-    converted_dict = {}
-
-    for full_key, tensor in lora_state_dict.items():
-        # full_key is like: "unet.down_blocks.0.attentions.0...to_q.lora_down.weight"
-        # We need to translate this key into Kohya format
-        # Standardize the target name.
-
-        # 1. Determine model prefix
-        prefix = ""
-        remaining = ""
-        if full_key.startswith("unet."):
-            prefix = "lora_unet_"
-            remaining = full_key[len("unet."):]
-        elif full_key.startswith("te1."):
-            prefix = "lora_te1_"
-            remaining = full_key[len("te1."):]
-        elif full_key.startswith("te2."):
-            prefix = "lora_te2_"
-            remaining = full_key[len("te2."):]
-        else:
-            # Fallback or custom module mapping
-            prefix = "lora_custom_"
-            remaining = full_key
-
-        # 2. Extract direction (down vs up, or weight type)
-        # remaining is like: "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_down.weight"
-        suffix = ""
-        if ".lora_down.weight" in remaining:
-            suffix = ".lora_down.weight"
-            remaining = remaining.replace(".lora_down.weight", "")
-        elif ".lora_up.weight" in remaining:
-            suffix = ".lora_up.weight"
-            remaining = remaining.replace(".lora_up.weight", "")
-        else:
-            # Unexpected suffix
-            continue
-
-        # 3. Clean and convert standard diffusers/transformers module path parts to Kohya-style underscores
-        # For UNet, replace dots with underscores
-        # For Text Encoders, we want "text_model_encoder_layers_..."
-        kohya_layer_name = remaining.replace(".", "_")
-
-        # Construct final Kohya format keys
-        kohya_key = f"{prefix}{kohya_layer_name}{suffix}"
-        converted_dict[kohya_key] = tensor
-
-        # Always inject the corresponding constant alpha value for this key
-        alpha_key = f"{prefix}{kohya_layer_name}.alpha"
-        converted_dict[alpha_key] = torch.tensor(alpha, dtype=torch.float32)
-
-    return converted_dict
+    return converted
 
 
 def export_kohya_safetensors(
@@ -80,28 +36,17 @@ def export_kohya_safetensors(
     alpha: float,
     output_filepath: str,
     metadata: Optional[Dict[str, str]] = None,
-    model_name: Optional[str] = None
+    model_name: Optional[str] = None,
 ) -> None:
-    """
-    Exports standard, ecosystem-compatible Kohya .safetensors LoRA checkpoint to disk.
-    Include optional metadata info.
-    """
-    converted_dict = convert_trainer_to_kohya_format(lora_state_dict, alpha)
-
-    # Standardize precision to float32 or bfloat16/float16 for ecosystem compatibility
-    output_dict = {}
-    for k, v in converted_dict.items():
-        output_dict[k] = v.contiguous()
-
-    # Enrich the safetensors __metadata__ header with kohya-standard keys so that
-    # ecosystem tools (sd-webui, ComfyUI, kohya utilities) correctly recognize this
-    # as an SDXL LoRA and scale it properly. Rank is read from a lora_down weight.
-    rank = None
-    for k, v in lora_state_dict.items():
-        if k.endswith(".lora_down.weight"):
-            rank = v.shape[0]
-            break
-    kohya_metadata = {
+    """Write adapter tensors with SDXL LoRA metadata. Caller metadata takes precedence."""
+    tensors = convert_trainer_to_kohya_format(lora_state_dict, alpha)
+    tensors = {key: value.contiguous() for key, value in tensors.items()}
+    rank = next(
+        (value.shape[0] for key, value in lora_state_dict.items()
+         if key.endswith(".lora_down.weight")),
+        None,
+    )
+    export_metadata = {
         "ss_base_model_version": "sdxl_base_v1-0",
         "ss_network_module": "networks.lora",
         "ss_network_type": "lora",
@@ -109,10 +54,8 @@ def export_kohya_safetensors(
         "ss_network_alpha": str(alpha),
     }
     if model_name:
-        kohya_metadata["ss_output_name"] = model_name
-
+        export_metadata["ss_output_name"] = model_name
     if metadata:
-        kohya_metadata.update(metadata)
+        export_metadata.update(metadata)
 
-    # Save to disk using safetensors library
-    save_file(output_dict, output_filepath, metadata=kohya_metadata)
+    save_file(tensors, output_filepath, metadata=export_metadata)
